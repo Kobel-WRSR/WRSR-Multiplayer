@@ -7,6 +7,11 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include "zstd.h"
+
+extern "C" {
+#include "bspatch.h"
+}
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "comctl32.lib")
@@ -19,12 +24,18 @@
 #define ID_LIST_PLAYERS 106
 #define ID_RADIO_HOST   107
 #define ID_RADIO_CLIENT 108
+#define ID_PROGRESS     109
+#define ID_LBL_PROGRESS 110
 #define TIMER_PING      1001
 
-#define MSG_SAVE 1
-#define MSG_PING 2
-#define MSG_PONG 3
-#define MSG_CHAT 4
+#define MSG_SAVE      1
+#define MSG_PING      2
+#define MSG_PONG      3
+#define MSG_CHAT      4
+#define MSG_SAVE_FULL 5
+#define MSG_SAVE_DIFF 6
+
+static const char* g_saveDir = "C:\\Program Files (x86)\\Steam\\steamapps\\common\\SovietRepublic\\media_soviet\\save\\mp_client";
 
 static HWND g_hwnd;
 static HWND g_btnConnect;
@@ -36,6 +47,8 @@ static HWND g_radioHost;
 static HWND g_radioClient;
 static HWND g_lblStatus;
 static HWND g_lblPing;
+static HWND g_progress;
+static HWND g_lblProgress;
 
 static SOCKET g_sock = INVALID_SOCKET;
 static bool g_connected = false;
@@ -47,10 +60,46 @@ struct MsgHeader {
     DWORD size;
 };
 
-static void SetStatus(const char* text)
+struct PatchStream {
+    const char* buf;
+    size_t pos;
+    size_t size;
+};
+
+static int PatchRead(const struct bspatch_stream* stream, void* buffer, int length)
 {
-    SetWindowTextA(g_lblStatus, text);
+    PatchStream* ps = (PatchStream*)stream->opaque;
+    if (ps->pos + length > ps->size) return -1;
+    memcpy(buffer, ps->buf + ps->pos, length);
+    ps->pos += length;
+    return 0;
 }
+
+static char* ReadFileLocal(const char* path, DWORD* outSize)
+{
+    HANDLE hFile = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ,
+                               NULL, OPEN_EXISTING, 0, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) { *outSize = 0; return nullptr; }
+    DWORD size = GetFileSize(hFile, NULL);
+    char* buf = (char*)malloc(size);
+    DWORD bytesRead;
+    ReadFile(hFile, buf, size, &bytesRead, NULL);
+    CloseHandle(hFile);
+    *outSize = size;
+    return buf;
+}
+
+static void WriteFileLocal(const char* path, const char* data, DWORD size)
+{
+    HANDLE hFile = CreateFileA(path, GENERIC_WRITE, 0,
+                               NULL, CREATE_ALWAYS, 0, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return;
+    DWORD written;
+    WriteFile(hFile, data, size, &written, NULL);
+    CloseHandle(hFile);
+}
+
+static void SetStatus(const char* text) { SetWindowTextA(g_lblStatus, text); }
 
 static void SetPing(DWORD ms)
 {
@@ -59,26 +108,26 @@ static void SetPing(DWORD ms)
     SetWindowTextA(g_lblPing, buf);
 }
 
-static void AddPlayer(const char* name, DWORD ping)
+static void SetProgress(int current, int total)
 {
-    char buf[128];
-    snprintf(buf, sizeof(buf), "%s  [%dms]", name, ping);
-    SendMessageA(g_listPlayers, LB_ADDSTRING, 0, (LPARAM)buf);
+    SendMessage(g_progress, PBM_SETRANGE, 0, MAKELPARAM(0, total));
+    SendMessage(g_progress, PBM_SETPOS, current, 0);
+    char buf[64];
+    snprintf(buf, sizeof(buf), "Files: %d / %d", current, total);
+    SetWindowTextA(g_lblProgress, buf);
 }
 
-static void ClearPlayers()
-{
-    SendMessage(g_listPlayers, LB_RESETCONTENT, 0, 0);
+static void AddPlayer(const char* name) {
+    SendMessageA(g_listPlayers, LB_ADDSTRING, 0, (LPARAM)name);
 }
+
+static void ClearPlayers() { SendMessage(g_listPlayers, LB_RESETCONTENT, 0, 0); }
 
 static void SendMsg(SOCKET sock, BYTE type, const void* data, DWORD size)
 {
-    MsgHeader hdr;
-    hdr.type = type;
-    hdr.size = size;
+    MsgHeader hdr; hdr.type = type; hdr.size = size;
     send(sock, (char*)&hdr, sizeof(hdr), 0);
-    if (data && size > 0)
-        send(sock, (char*)data, size, 0);
+    if (data && size > 0) send(sock, (char*)data, size, 0);
 }
 
 static bool RecvExact(SOCKET sock, char* buf, DWORD size)
@@ -90,6 +139,56 @@ static bool RecvExact(SOCKET sock, char* buf, DWORD size)
         remaining -= got;
     }
     return true;
+}
+
+static void RecvFileFull(SOCKET sock, const char* path)
+{
+    DWORD origSize = 0, compSize = 0;
+    recv(sock, (char*)&origSize, sizeof(DWORD), MSG_WAITALL);
+    recv(sock, (char*)&compSize, sizeof(DWORD), MSG_WAITALL);
+    if (origSize == 0 || compSize == 0) return;
+
+    char* compBuf = (char*)malloc(compSize);
+    RecvExact(sock, compBuf, compSize);
+
+    char* origBuf = (char*)malloc(origSize);
+    size_t result = ZSTD_decompress(origBuf, origSize, compBuf, compSize);
+    free(compBuf);
+
+    if (!ZSTD_isError(result))
+        WriteFileLocal(path, origBuf, (DWORD)result);
+    free(origBuf);
+}
+
+static void RecvFileDiff(SOCKET sock, const char* path)
+{
+    DWORD newSize = 0, rawDiffSize = 0, compDiffSize = 0;
+    recv(sock, (char*)&newSize, sizeof(DWORD), MSG_WAITALL);
+    recv(sock, (char*)&rawDiffSize, sizeof(DWORD), MSG_WAITALL);
+    recv(sock, (char*)&compDiffSize, sizeof(DWORD), MSG_WAITALL);
+    if (newSize == 0 || rawDiffSize == 0 || compDiffSize == 0) return;
+
+    char* compDiff = (char*)malloc(compDiffSize);
+    RecvExact(sock, compDiff, compDiffSize);
+
+    char* rawDiff = (char*)malloc(rawDiffSize);
+    ZSTD_decompress(rawDiff, rawDiffSize, compDiff, compDiffSize);
+    free(compDiff);
+
+    DWORD oldSize = 0;
+    char* oldData = ReadFileLocal(path, &oldSize);
+    if (!oldData) { free(rawDiff); return; }
+
+    char* newData = (char*)malloc(newSize);
+    PatchStream ps = { rawDiff, 0, rawDiffSize };
+    struct bspatch_stream stream = {};
+    stream.opaque = &ps;
+    stream.read   = PatchRead;
+
+    if (bspatch((uint8_t*)oldData, oldSize, (uint8_t*)newData, newSize, &stream) == 0)
+        WriteFileLocal(path, newData, newSize);
+
+    free(rawDiff); free(oldData); free(newData);
 }
 
 static DWORD WINAPI RecvThread(LPVOID)
@@ -109,17 +208,17 @@ static DWORD WINAPI RecvThread(LPVOID)
         }
 
         if (hdr.type == MSG_PONG) {
-            DWORD ping = GetTickCount() - g_lastPing;
-            SetPing(ping);
+            SetPing(GetTickCount() - g_lastPing);
             continue;
         }
 
-        if (hdr.size == 0) continue;
-
-        if (hdr.type == MSG_SAVE) {
+        if (hdr.type == MSG_SAVE_FULL || hdr.type == MSG_SAVE_DIFF) {
+            bool isDiff = (hdr.type == MSG_SAVE_DIFF);
             int fileCount = 0;
             recv(g_sock, (char*)&fileCount, sizeof(int), MSG_WAITALL);
-            SetStatus("Receiving save...");
+            SetStatus(isDiff ? "Receiving delta..." : "Receiving save...");
+            SetProgress(0, fileCount);
+            CreateDirectoryA(g_saveDir, NULL);
 
             for (int i = 0; i < fileCount; i++) {
                 int nameLen = 0;
@@ -127,56 +226,27 @@ static DWORD WINAPI RecvThread(LPVOID)
                 char fileName[MAX_PATH] = {};
                 recv(g_sock, fileName, nameLen, MSG_WAITALL);
 
-                DWORD fileSize = 0;
-                recv(g_sock, (char*)&fileSize, sizeof(DWORD), MSG_WAITALL);
+                char path[MAX_PATH];
+                snprintf(path, MAX_PATH, "%s\\%s", g_saveDir, fileName);
 
-                char savePath[MAX_PATH];
-                snprintf(savePath, MAX_PATH,
-                    "C:\\Program Files (x86)\\Steam\\steamapps\\common\\SovietRepublic\\media_soviet\\save\\mp_client\\%s",
-                    fileName);
+                if (isDiff) RecvFileDiff(g_sock, path);
+                else        RecvFileFull(g_sock, path);
 
-                CreateDirectoryA(
-                    "C:\\Program Files (x86)\\Steam\\steamapps\\common\\SovietRepublic\\media_soviet\\save\\mp_client",
-                    NULL);
-
-                HANDLE hFile = CreateFileA(savePath, GENERIC_WRITE, 0,
-                                           NULL, CREATE_ALWAYS, 0, NULL);
-
-                char buf[65536];
-                DWORD remaining = fileSize;
-                while (remaining > 0) {
-                    int toRead = remaining < sizeof(buf) ? remaining : sizeof(buf);
-                    int r = recv(g_sock, buf, toRead, 0);
-                    if (r <= 0) break;
-                    DWORD written;
-                    WriteFile(hFile, buf, r, &written, NULL);
-                    remaining -= r;
-                }
-                CloseHandle(hFile);
+                SetProgress(i + 1, fileCount);
             }
 
-            SetStatus("Save received! Load mp_client");
+            SetStatus(isDiff ? "Delta applied! Reload save." : "Done! Load mp_client.");
+            SetProgress(fileCount, fileCount);
             continue;
         }
 
-        if (hdr.type == MSG_CHAT) {
+        if (hdr.type == MSG_CHAT && hdr.size > 0) {
             char* tmp = (char*)malloc(hdr.size + 1);
-            if (tmp) {
-                RecvExact(g_sock, tmp, hdr.size);
-                tmp[hdr.size] = 0;
-                SendMessageA(g_editChat, EM_REPLACESEL, FALSE, (LPARAM)tmp);
-                SendMessageA(g_editChat, EM_REPLACESEL, FALSE, (LPARAM)"\r\n");
-                free(tmp);
-            }
-            continue;
-        }
-
-        if (hdr.size > 0) {
-            char* tmp = (char*)malloc(hdr.size);
-            if (tmp) {
-                RecvExact(g_sock, tmp, hdr.size);
-                free(tmp);
-            }
+            RecvExact(g_sock, tmp, hdr.size);
+            tmp[hdr.size] = 0;
+            SendMessageA(g_editChat, EM_REPLACESEL, FALSE, (LPARAM)tmp);
+            SendMessageA(g_editChat, EM_REPLACESEL, FALSE, (LPARAM)"\r\n");
+            free(tmp);
         }
     }
     return 0;
@@ -184,8 +254,7 @@ static DWORD WINAPI RecvThread(LPVOID)
 
 static void Connect()
 {
-    char ip[64] = {};
-    char name[64] = {};
+    char ip[64] = {}, name[64] = {};
     GetWindowTextA(g_editIp, ip, sizeof(ip));
     GetWindowTextA(g_editName, name, sizeof(name));
     if (!name[0]) strcpy(name, "Player");
@@ -203,8 +272,7 @@ static void Connect()
     SetStatus("Connecting...");
     if (connect(g_sock, (sockaddr*)&addr, sizeof(addr)) != 0) {
         SetStatus("Connection failed");
-        closesocket(g_sock);
-        g_sock = INVALID_SOCKET;
+        closesocket(g_sock); g_sock = INVALID_SOCKET;
         return;
     }
 
@@ -215,7 +283,7 @@ static void Connect()
     g_connected = true;
     SetStatus("Connected!");
     ClearPlayers();
-    AddPlayer(name, 0);
+    AddPlayer(name);
     CreateThread(NULL, 0, RecvThread, NULL, 0, NULL);
     SetTimer(g_hwnd, TIMER_PING, 5000, NULL);
     SetWindowTextA(g_btnConnect, "Disconnect");
@@ -224,15 +292,14 @@ static void Connect()
 static void Disconnect()
 {
     g_connected = false;
-    if (g_sock != INVALID_SOCKET) {
-        closesocket(g_sock);
-        g_sock = INVALID_SOCKET;
-    }
+    if (g_sock != INVALID_SOCKET) { closesocket(g_sock); g_sock = INVALID_SOCKET; }
     KillTimer(g_hwnd, TIMER_PING);
     SetStatus("Disconnected");
     ClearPlayers();
     SetWindowTextA(g_lblPing, "Ping: --");
     SetWindowTextA(g_btnConnect, "Connect");
+    SetProgress(0, 100);
+    SetWindowTextA(g_lblProgress, "");
 }
 
 static void SendChat()
@@ -254,6 +321,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
     case WM_CREATE: {
+        INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_PROGRESS_CLASS };
+        InitCommonControlsEx(&icc);
+
         HFONT hFont = CreateFontA(16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
             DEFAULT_QUALITY, DEFAULT_PITCH, "Segoe UI");
@@ -282,20 +352,23 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         g_lblStatus = Make("STATIC", "Not connected", 0, 10, 138, 225, 20, 0);
         g_lblPing   = Make("STATIC", "Ping: --", 0, 10, 158, 225, 20, 0);
 
-        Make("STATIC", "Players online:", 0, 10, 185, 225, 20, 0);
-        g_listPlayers = Make("LISTBOX", "", WS_BORDER|LBS_NOTIFY, 10, 205, 225, 80, ID_LIST_PLAYERS);
+        g_lblProgress = Make("STATIC", "", 0, 10, 183, 225, 18, ID_LBL_PROGRESS);
+        g_progress = Make(PROGRESS_CLASS, "", PBS_SMOOTH, 10, 203, 225, 18, ID_PROGRESS);
+        SendMessage(g_progress, PBM_SETRANGE, 0, MAKELPARAM(0, 100));
 
-        Make("STATIC", "Chat:", 0, 10, 295, 225, 20, 0);
-        g_editChat = Make("EDIT", "", WS_BORDER|ES_MULTILINE|ES_READONLY|WS_VSCROLL, 10, 315, 225, 80, 0);
+        Make("STATIC", "Players online:", 0, 10, 230, 225, 20, 0);
+        g_listPlayers = Make("LISTBOX", "", WS_BORDER|LBS_NOTIFY, 10, 250, 225, 70, ID_LIST_PLAYERS);
 
-        Make("EDIT", "", WS_BORDER, 10, 403, 170, 22, 200);
-        Make("BUTTON", "Send", BS_PUSHBUTTON, 185, 401, 50, 26, ID_BTN_CHAT);
+        Make("STATIC", "Chat:", 0, 10, 330, 225, 20, 0);
+        g_editChat = Make("EDIT", "", WS_BORDER|ES_MULTILINE|ES_READONLY|WS_VSCROLL, 10, 350, 225, 70, 0);
+
+        Make("EDIT", "", WS_BORDER, 10, 428, 170, 22, 200);
+        Make("BUTTON", "Send", BS_PUSHBUTTON, 185, 426, 50, 26, ID_BTN_CHAT);
         break;
     }
     case WM_COMMAND:
         if (LOWORD(wp) == ID_BTN_CONNECT) {
-            if (!g_connected) Connect();
-            else Disconnect();
+            if (!g_connected) Connect(); else Disconnect();
         }
         if (LOWORD(wp) == ID_BTN_CHAT) SendChat();
         break;
@@ -323,9 +396,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
     wc.hCursor       = LoadCursor(NULL, IDC_ARROW);
     RegisterClassA(&wc);
 
-    g_hwnd = CreateWindowA("WRSRMultiplayer", "WRSR Multiplayer v0.1",
+    g_hwnd = CreateWindowA("WRSRMultiplayer", "WRSR Multiplayer v0.2",
         WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX,
-        100, 100, 255, 470, NULL, NULL, hInst, NULL);
+        100, 100, 255, 500, NULL, NULL, hInst, NULL);
 
     ShowWindow(g_hwnd, SW_SHOW);
     UpdateWindow(g_hwnd);
