@@ -7,23 +7,30 @@
 #include "../../src/tesmio_api.h"
 #include <stdio.h>
 #include <string.h>
-#include <time.h>
+#include <stdlib.h>
+#include "zstd.h"
+
+extern "C" {
+#include "bsdiff.h"
+#include "bspatch.h"
+}
 
 #pragma comment(lib, "ws2_32.lib")
 
 #define MAX_PLAYERS 4
-#define MSG_SAVE    1
-#define MSG_PING    2
-#define MSG_PONG    3
-#define MSG_CHAT    4
-#define MSG_JOIN    5
+#define MSG_SAVE      1
+#define MSG_PING      2
+#define MSG_PONG      3
+#define MSG_CHAT      4
+#define MSG_SAVE_FULL 5
+#define MSG_SAVE_DIFF 6
 
 static const TsmHost* H = nullptr;
 static char g_saveDir[MAX_PATH];
 static char g_syncDir[MAX_PATH];
+static char g_playerName[64];
 static char g_mode[32];
 static char g_hostIp[64];
-static char g_playerName[64];
 static int  g_port = 7777;
 
 struct Player {
@@ -31,6 +38,7 @@ struct Player {
     char name[64];
     DWORD ping;
     bool connected;
+    bool hasFullSave;
 };
 
 static Player g_players[MAX_PLAYERS];
@@ -38,6 +46,8 @@ static int g_playerCount = 0;
 static HANDLE g_watchThread  = NULL;
 static HANDLE g_serverThread = NULL;
 static CRITICAL_SECTION g_lock;
+
+static char g_prevSaveDir[MAX_PATH];
 
 struct MsgHeader {
     BYTE type;
@@ -65,39 +75,105 @@ static bool RecvMsg(SOCKET sock, MsgHeader* hdr, char* buf, DWORD bufSize)
     return true;
 }
 
-static void SendFile(SOCKET sock, const char* path)
+static char* ReadFile(const char* path, DWORD* outSize)
 {
     HANDLE hFile = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ,
                                NULL, OPEN_EXISTING, 0, NULL);
-    if (hFile == INVALID_HANDLE_VALUE) return;
-    DWORD fileSize = GetFileSize(hFile, NULL);
-    send(sock, (char*)&fileSize, sizeof(DWORD), 0);
-    char buf[65536];
+    if (hFile == INVALID_HANDLE_VALUE) { *outSize = 0; return nullptr; }
+    DWORD size = GetFileSize(hFile, NULL);
+    char* buf = (char*)malloc(size);
+    if (!buf) { CloseHandle(hFile); *outSize = 0; return nullptr; }
     DWORD bytesRead;
-    while (ReadFile(hFile, buf, sizeof(buf), &bytesRead, NULL) && bytesRead > 0)
-        send(sock, buf, bytesRead, 0);
+    ReadFile(hFile, buf, size, &bytesRead, NULL);
     CloseHandle(hFile);
+    *outSize = size;
+    return buf;
 }
 
-static void RecvFile(SOCKET sock, const char* path)
+static void SendCompressed(SOCKET sock, const char* data, DWORD size)
 {
-    DWORD fileSize = 0;
-    recv(sock, (char*)&fileSize, sizeof(DWORD), MSG_WAITALL);
-    if (fileSize == 0 || fileSize > 512 * 1024 * 1024) return;
-    HANDLE hFile = CreateFileA(path, GENERIC_WRITE, 0,
-                               NULL, CREATE_ALWAYS, 0, NULL);
-    if (hFile == INVALID_HANDLE_VALUE) return;
-    char buf[65536];
-    DWORD remaining = fileSize;
-    while (remaining > 0) {
-        int toRead = (remaining < sizeof(buf)) ? remaining : sizeof(buf);
-        int got = recv(sock, buf, toRead, MSG_WAITALL);
-        if (got <= 0) break;
-        DWORD written;
-        WriteFile(hFile, buf, got, &written, NULL);
-        remaining -= got;
+    size_t cap = ZSTD_compressBound(size);
+    char* dst = (char*)malloc(cap);
+    size_t cSize = ZSTD_compress(dst, cap, data, size, 3);
+    send(sock, (char*)&size, sizeof(DWORD), 0);
+    DWORD cs = (DWORD)cSize;
+    send(sock, (char*)&cs, sizeof(DWORD), 0);
+    send(sock, dst, cs, 0);
+    free(dst);
+}
+
+struct DiffStream {
+    char* buf;
+    size_t size;
+    size_t cap;
+};
+
+static int DiffWrite(struct bsdiff_stream* stream, const void* buffer, int size)
+{
+    DiffStream* ds = (DiffStream*)stream->opaque;
+    if (ds->size + size > ds->cap) {
+        ds->cap = (ds->size + size) * 2;
+        ds->buf = (char*)realloc(ds->buf, ds->cap);
     }
-    CloseHandle(hFile);
+    memcpy(ds->buf + ds->size, buffer, size);
+    ds->size += size;
+    return 0;
+}
+
+static void SendFileFull(SOCKET sock, const char* path)
+{
+    DWORD size;
+    char* data = ReadFile(path, &size);
+    if (!data) {
+        DWORD z = 0;
+        send(sock, (char*)&z, sizeof(DWORD), 0);
+        send(sock, (char*)&z, sizeof(DWORD), 0);
+        return;
+    }
+    SendCompressed(sock, data, size);
+    free(data);
+}
+
+static void SendFileDiff(SOCKET sock, const char* newPath, const char* oldPath)
+{
+    DWORD newSize, oldSize;
+    char* newData = ReadFile(newPath, &newSize);
+    char* oldData = ReadFile(oldPath, &oldSize);
+
+    if (!newData || !oldData || oldSize == 0) {
+        if (newData) SendCompressed(sock, newData, newSize);
+        else { DWORD z = 0; send(sock, (char*)&z, sizeof(DWORD), 0); send(sock, (char*)&z, sizeof(DWORD), 0); }
+        free(newData); free(oldData);
+        return;
+    }
+
+    DiffStream ds = {};
+    ds.cap = 4096;
+    ds.buf = (char*)malloc(ds.cap);
+
+    struct bsdiff_stream stream = {};
+    stream.opaque = &ds;
+    stream.malloc = malloc;
+    stream.free   = free;
+    stream.write  = DiffWrite;
+
+    send(sock, (char*)&newSize, sizeof(DWORD), 0);
+
+    if (bsdiff((uint8_t*)oldData, oldSize, (uint8_t*)newData, newSize, &stream) == 0) {
+        size_t cap = ZSTD_compressBound(ds.size);
+        char* comp = (char*)malloc(cap);
+        size_t cSize = ZSTD_compress(comp, cap, ds.buf, ds.size, 3);
+        DWORD rawDiffSize = (DWORD)ds.size;
+        DWORD compDiffSize = (DWORD)cSize;
+        send(sock, (char*)&rawDiffSize, sizeof(DWORD), 0);
+        send(sock, (char*)&compDiffSize, sizeof(DWORD), 0);
+        send(sock, comp, compDiffSize, 0);
+        free(comp);
+    }
+
+    free(ds.buf);
+    free(newData);
+    free(oldData);
 }
 
 static void GetLatestSave(char* outName)
@@ -115,23 +191,19 @@ static void GetLatestSave(char* outName)
         if (strcmp(fd.cFileName, "..") == 0) continue;
         if (strcmp(fd.cFileName, "mp_client") == 0) continue;
         if (strncmp(fd.cFileName, "autosave", 8) == 0) continue;
-        char scriptPath[MAX_PATH];
-        snprintf(scriptPath, MAX_PATH, "%s\\%s\\script.ini", g_saveDir, fd.cFileName);
-        WIN32_FIND_DATAA fd2;
-        HANDLE h2 = FindFirstFileA(scriptPath, &fd2);
-        if (h2 == INVALID_HANDLE_VALUE) continue;
-        FindClose(h2);
-        if (CompareFileTime(&fd2.ftLastWriteTime, &latest) > 0) {
-            latest = fd2.ftLastWriteTime;
+        H->log("multiplayer  found folder: %s", fd.cFileName);
+        if (CompareFileTime(&fd.ftLastWriteTime, &latest) > 0) {
+            latest = fd.ftLastWriteTime;
             strcpy(outName, fd.cFileName);
         }
     } while (FindNextFileA(hFind, &fd));
     FindClose(hFind);
+    H->log("multiplayer  latest save: %s", outName[0] ? outName : "(none)");
 }
 
-static void SyncSaveToPlayer(int playerIdx)
+static void SyncSaveToPlayer(int idx)
 {
-    Player& p = g_players[playerIdx];
+    Player& p = g_players[idx];
     if (!p.connected || p.sock == INVALID_SOCKET) return;
 
     char latestSave[MAX_PATH];
@@ -141,8 +213,11 @@ static void SyncSaveToPlayer(int playerIdx)
         return;
     }
 
+    char newSavePath[MAX_PATH];
+    snprintf(newSavePath, MAX_PATH, "%s\\%s", g_saveDir, latestSave);
+
     char pattern[MAX_PATH];
-    snprintf(pattern, MAX_PATH, "%s\\%s\\*", g_saveDir, latestSave);
+    snprintf(pattern, MAX_PATH, "%s\\*", newSavePath);
     WIN32_FIND_DATAA fd;
     HANDLE hFind = FindFirstFileA(pattern, &fd);
     if (hFind == INVALID_HANDLE_VALUE) return;
@@ -154,7 +229,9 @@ static void SyncSaveToPlayer(int playerIdx)
     } while (FindNextFileA(hFind, &fd));
     FindClose(hFind);
 
-    SendMsg(p.sock, MSG_SAVE, &fileCount, sizeof(int));
+    bool useDiff = p.hasFullSave && g_prevSaveDir[0];
+    BYTE msgType = useDiff ? MSG_SAVE_DIFF : MSG_SAVE_FULL;
+    SendMsg(p.sock, msgType, &fileCount, sizeof(int));
 
     hFind = FindFirstFileA(pattern, &fd);
     do {
@@ -162,13 +239,25 @@ static void SyncSaveToPlayer(int playerIdx)
         int nameLen = (int)strlen(fd.cFileName) + 1;
         send(p.sock, (char*)&nameLen, sizeof(int), 0);
         send(p.sock, fd.cFileName, nameLen, 0);
-        char fullPath[MAX_PATH];
-        snprintf(fullPath, MAX_PATH, "%s\\%s\\%s", g_saveDir, latestSave, fd.cFileName);
-        SendFile(p.sock, fullPath);
+
+        char newFile[MAX_PATH];
+        snprintf(newFile, MAX_PATH, "%s\\%s", newSavePath, fd.cFileName);
+
+        if (useDiff) {
+            char oldFile[MAX_PATH];
+            snprintf(oldFile, MAX_PATH, "%s\\%s\\%s", g_saveDir, g_prevSaveDir, fd.cFileName);
+            SendFileDiff(p.sock, newFile, oldFile);
+        } else {
+            SendFileFull(p.sock, newFile);
+        }
     } while (FindNextFileA(hFind, &fd));
     FindClose(hFind);
 
-    H->log("multiplayer  save sent to %s", p.name);
+    p.hasFullSave = true;
+    strncpy(g_prevSaveDir, latestSave, MAX_PATH - 1);
+
+    H->log("multiplayer  save sent (%s) to %s",
+           useDiff ? "diff" : "full", p.name);
 }
 
 static void SyncSaveToAll()
@@ -194,14 +283,13 @@ static DWORD WINAPI PingThread(LPVOID arg)
         DWORD t1 = GetTickCount();
         SendMsg(g_players[idx].sock, MSG_PING, nullptr, 0);
         LeaveCriticalSection(&g_lock);
-
         MsgHeader hdr;
         char buf[256];
         if (RecvMsg(g_players[idx].sock, &hdr, buf, sizeof(buf))) {
             if (hdr.type == MSG_PONG) {
-                DWORD ping = GetTickCount() - t1;
-                g_players[idx].ping = ping;
-                H->log("multiplayer  ping %s: %dms", g_players[idx].name, ping);
+                g_players[idx].ping = GetTickCount() - t1;
+                H->log("multiplayer  ping %s: %dms",
+                       g_players[idx].name, g_players[idx].ping);
             }
         }
     }
@@ -212,28 +300,25 @@ static DWORD WINAPI ClientThread(LPVOID arg)
 {
     int idx = (int)(intptr_t)arg;
     Player& p = g_players[idx];
-
     H->log("multiplayer  player joined: %s", p.name);
-
     MsgHeader hdr;
     char buf[256];
     while (RecvMsg(p.sock, &hdr, buf, sizeof(buf))) {
-        if (hdr.type == MSG_PING) {
+        if (hdr.type == MSG_PING)
             SendMsg(p.sock, MSG_PONG, nullptr, 0);
-        } else if (hdr.type == MSG_CHAT) {
+        else if (hdr.type == MSG_CHAT) {
             buf[hdr.size] = 0;
             H->log("multiplayer  [%s]: %s", p.name, buf);
         }
     }
-
     EnterCriticalSection(&g_lock);
     p.connected = false;
+    p.hasFullSave = false;
     closesocket(p.sock);
     p.sock = INVALID_SOCKET;
     g_playerCount--;
     H->log("multiplayer  player left: %s", p.name);
     LeaveCriticalSection(&g_lock);
-
     return 0;
 }
 
@@ -257,42 +342,35 @@ static DWORD WINAPI ServerThread(LPVOID)
     }
     listen(listenSock, MAX_PLAYERS);
     H->log("multiplayer  server listening on port %d", g_port);
-
     while (true) {
         SOCKET client = accept(listenSock, NULL, NULL);
         if (client == INVALID_SOCKET) continue;
-
         EnterCriticalSection(&g_lock);
         if (g_playerCount >= MAX_PLAYERS) {
             LeaveCriticalSection(&g_lock);
             closesocket(client);
             continue;
         }
-
         int nameLen = 0;
         recv(client, (char*)&nameLen, sizeof(int), MSG_WAITALL);
         char name[64] = "Unknown";
         if (nameLen > 0 && nameLen < 64)
             recv(client, name, nameLen, MSG_WAITALL);
-
         int slot = -1;
         for (int i = 0; i < MAX_PLAYERS; i++) {
             if (!g_players[i].connected) { slot = i; break; }
         }
-
         if (slot >= 0) {
             g_players[slot].sock = client;
             g_players[slot].ping = 0;
             g_players[slot].connected = true;
+            g_players[slot].hasFullSave = false;
             strncpy(g_players[slot].name, name, 63);
             g_playerCount++;
-
             H->log("multiplayer  client connected: %s (%d/%d)",
                    name, g_playerCount, MAX_PLAYERS);
-
             CreateThread(NULL, 0, ClientThread, (LPVOID)(intptr_t)slot, 0, NULL);
             CreateThread(NULL, 0, PingThread,   (LPVOID)(intptr_t)slot, 0, NULL);
-
             SyncSaveToPlayer(slot);
         }
         LeaveCriticalSection(&g_lock);
@@ -330,7 +408,7 @@ extern "C" __declspec(dllexport) int TsmPluginInit(
 {
     H = host;
     info->name    = "multiplayer";
-    info->version = "0.1.0";
+    info->version = "0.2.0";
     if (!H->configInt("plugins\\multiplayer.ini", "multiplayer", "enabled", 1))
         return 1;
     H->configString("plugins\\multiplayer.ini", "multiplayer", "mode",
@@ -343,7 +421,8 @@ extern "C" __declspec(dllexport) int TsmPluginInit(
     memset(g_players, 0, sizeof(g_players));
     for (int i = 0; i < MAX_PLAYERS; i++)
         g_players[i].sock = INVALID_SOCKET;
-    H->log("multiplayer  v0.1.0 loaded OK (mode: %s, name: %s)",
+    g_prevSaveDir[0] = 0;
+    H->log("multiplayer  v0.2.0 loaded OK (mode: %s, name: %s)",
            g_mode, g_playerName);
     return 0;
 }
@@ -361,7 +440,7 @@ extern "C" __declspec(dllexport) int TsmPluginStart(void)
     WSAStartup(MAKEWORD(2, 2), &wsa);
     g_serverThread = CreateThread(NULL, 0, ServerThread, NULL, 0, NULL);
     g_watchThread  = CreateThread(NULL, 0, WatchThread,  NULL, 0, NULL);
-    H->log("multiplayer  HOST mode started on port %d", g_port);
+    H->log("multiplayer  HOST mode started on port %d (zstd+bsdiff)", g_port);
     return 0;
 }
 
