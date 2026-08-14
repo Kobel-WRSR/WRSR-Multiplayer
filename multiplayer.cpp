@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <math.h>
 #include "zstd.h"
 
 extern "C" {
@@ -28,6 +29,9 @@ extern "C" {
 
 #define DIFF_SIZE_LIMIT (10 * 1024 * 1024)
 
+#define CLICK_FLAG_RVA  0xA54E91
+#define HOOK_TARGET_RVA 0x6F8CC0
+
 static const TsmHost* H = nullptr;
 static char g_saveDir[MAX_PATH];
 static char g_syncDir[MAX_PATH];
@@ -40,7 +44,6 @@ static int  g_port = 7777;
 struct BuildCmd {
     float x, y, z;
     float rotation;
-    DWORD typeId;
     char  typeName[64];
 };
 #pragma pack(pop)
@@ -71,6 +74,7 @@ struct PlayerLockGuard {
 typedef void (*BuildHandlerFn)(__int64, char*);
 static BuildHandlerFn g_origBuildHandler = nullptr;
 static BYTE g_hookOrigBytes[14];
+static HMODULE g_hExe = nullptr;
 
 struct MsgHeader {
     BYTE  type;
@@ -142,72 +146,96 @@ static void SendBuildToAll(const BuildCmd* cmd)
     LeaveCriticalSection(&g_lock);
 }
 
+static bool SafeReadString(const char* ptr, char* out, int maxLen)
+{
+    if (!ptr) return false;
+    __try {
+        int i = 0;
+        while (i < maxLen - 1) {
+            char c = ptr[i];
+            if (c == 0) break;
+            if (c < 0x20 || c > 0x7E) return false;
+            out[i] = c;
+            i++;
+        }
+        out[i] = 0;
+        return i >= 3;
+    }
+    __except(EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+static ULONGLONG s_lastBuildTime = 0;
+
 static void HookedBuildHandler(__int64 param_1, char* param_2)
 {
-    if (param_2 && param_2[0x20] != '\0') {
-        BuildCmd cmd = {};
+    bool shouldSend = false;
+    BuildCmd cmd = {};
 
-        __int64 building = 0;
-        if (param_1) {
-            __int64 b1 = *(__int64*)(param_1 + 0x11b00);
-            __int64 b2 = *(__int64*)(param_1 + 0x11af8);
-            building = b1 ? b1 : b2;
+    if (g_hExe && param_2) {
+        BYTE p2_20 = 0;
+        __try { p2_20 = param_2[0x20]; } __except(EXCEPTION_EXECUTE_HANDLER) {}
+
+        BYTE flag = 0;
+        BYTE* clickFlag = (BYTE*)((DWORD_PTR)g_hExe + CLICK_FLAG_RVA);
+        __try { flag = *clickFlag; } __except(EXCEPTION_EXECUTE_HANDLER) {}
+
+        if (p2_20 != '\0' && flag != '\0') {
+            __try {
+                __int64 lVar5 = *(__int64*)((__int64)param_2 + 0x240);
+                if (lVar5 > 0x10000) {
+                    float x = *(float*)(lVar5 + 0x320);
+                    float z = *(float*)(lVar5 + 0x328);
+                    if (x > -100000 && x < 100000 && z > -100000 && z < 100000) {
+                        cmd.x = x;
+                        cmd.z = z;
+                        shouldSend = true;
+                    }
+                }
+            } __except(EXCEPTION_EXECUTE_HANDLER) {}
         }
-
-        if (building != 0) {
-            cmd.x = *(float*)(building + 0x320 + 0x00);
-            cmd.y = *(float*)(building + 0x320 + 0x04);
-            cmd.z = *(float*)(building + 0x320 + 0x08);
-
-            char* typeName = (char*)(param_1 + 0x1386c);
-            if (typeName && typeName[0] != 0)
-                strncpy_s(cmd.typeName, typeName, sizeof(cmd.typeName) - 1);
-        }
-
-        H->log("multiplayer  BUILD: %s at %.1f %.1f %.1f",
-               cmd.typeName[0] ? cmd.typeName : "unknown",
-               cmd.x, cmd.y, cmd.z);
-
-        SendBuildToAll(&cmd);
     }
 
     g_origBuildHandler(param_1, param_2);
-}
 
+    if (shouldSend) {
+        ULONGLONG now = GetTickCount64();
+        if (now - s_lastBuildTime > 1000) {
+            s_lastBuildTime = now;
+            H->log("multiplayer  BUILD at %.1f %.1f", cmd.x, cmd.z);
+            SendBuildToAll(&cmd);
+        }
+    }
+}
 static bool InstallBuildHook()
 {
-    const DWORD_PTR TARGET_RVA = 0x6F8CC0;
-
-    HMODULE hExe = GetModuleHandleA("SOVIET64.exe");
-    if (!hExe) {
+    g_hExe = GetModuleHandleA("SOVIET64.exe");
+    if (!g_hExe) {
         H->log("multiplayer  hook: SOVIET64.exe not found");
         return false;
     }
 
-    BYTE* target = (BYTE*)((DWORD_PTR)hExe + TARGET_RVA);
+    BYTE* target = (BYTE*)((DWORD_PTR)g_hExe + HOOK_TARGET_RVA);
 
     if (target[0] != 0x48 || target[1] != 0x8B || target[2] != 0xC4) {
-        H->log("multiplayer  hook: bytes mismatch %02X %02X %02X - skip",
+        H->log("multiplayer  hook: mismatch %02X %02X %02X",
                target[0], target[1], target[2]);
         return false;
     }
 
     BYTE* trampoline = nullptr;
     DWORD_PTR base = (DWORD_PTR)target;
-    for (DWORD_PTR delta = 0x10000000; delta < 0x70000000; delta += 0x1000000) {
-        trampoline = (BYTE*)VirtualAlloc(
-            (void*)(base - delta), 64,
+    for (DWORD_PTR delta = 0x1000000; delta < 0x70000000; delta += 0x1000000) {
+        trampoline = (BYTE*)VirtualAlloc((void*)(base - delta), 64,
             MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
         if (trampoline) break;
-        trampoline = (BYTE*)VirtualAlloc(
-            (void*)(base + delta), 64,
+        trampoline = (BYTE*)VirtualAlloc((void*)(base + delta), 64,
             MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
         if (trampoline) break;
     }
-    if (!trampoline) {
-        trampoline = (BYTE*)VirtualAlloc(
-            NULL, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-    }
+    if (!trampoline)
+        trampoline = (BYTE*)VirtualAlloc(NULL, 64,
+            MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     if (!trampoline) {
         H->log("multiplayer  hook: trampoline alloc failed");
         return false;
@@ -225,7 +253,7 @@ static bool InstallBuildHook()
 
     trampoline[14] = 0xFF;
     trampoline[15] = 0x25;
-    *(DWORD*)(trampoline + 16) = 0x00000000;
+    *(DWORD*)(trampoline + 16) = 0;
     *(DWORD_PTR*)(trampoline + 20) = (DWORD_PTR)(target + 14);
 
     g_origBuildHandler = (BuildHandlerFn)trampoline;
@@ -428,17 +456,23 @@ static void SyncSaveToPlayer(int idx)
     do {
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
         int nameLen = (int)strlen(fd.cFileName) + 1;
-        { PlayerLockGuard lock(p); SendAll(p.sock, (char*)&nameLen, sizeof(int)); SendAll(p.sock, fd.cFileName, nameLen); }
-
+        {
+            PlayerLockGuard lock(p);
+            SendAll(p.sock, (char*)&nameLen, sizeof(int));
+            SendAll(p.sock, fd.cFileName, nameLen);
+        }
         char newFile[MAX_PATH];
         snprintf(newFile, MAX_PATH, "%s/%s", newSavePath, fd.cFileName);
-
         if (useDiff) {
             char oldFile[MAX_PATH];
             snprintf(oldFile, MAX_PATH, "%s/%s/%s", g_saveDir, p.prevSaveDir, fd.cFileName);
             DWORD oldFileSize = 0;
-            HANDLE hCheck = CreateFileA(oldFile, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
-            if (hCheck != INVALID_HANDLE_VALUE) { oldFileSize = GetFileSize(hCheck, NULL); CloseHandle(hCheck); }
+            HANDLE hCheck = CreateFileA(oldFile, GENERIC_READ, FILE_SHARE_READ,
+                                        NULL, OPEN_EXISTING, 0, NULL);
+            if (hCheck != INVALID_HANDLE_VALUE) {
+                oldFileSize = GetFileSize(hCheck, NULL);
+                CloseHandle(hCheck);
+            }
             if (oldFileSize > DIFF_SIZE_LIMIT) SendFileFullToPlayer(p, newFile);
             else SendFileDiffToPlayer(p, newFile, oldFile);
         } else {
@@ -449,7 +483,8 @@ static void SyncSaveToPlayer(int idx)
 
     p.hasFullSave = true;
     strncpy(p.prevSaveDir, latestSave, MAX_PATH - 1);
-    H->log("multiplayer  save sent (%s) to %s", useDiff ? "diff+full" : "full", p.name);
+    H->log("multiplayer  save sent (%s) to %s",
+           useDiff ? "diff+full" : "full", p.name);
 }
 
 static void SyncSaveToAll()
@@ -507,7 +542,9 @@ static DWORD WINAPI ClientThread(LPVOID arg)
 static DWORD WINAPI ServerThread(LPVOID)
 {
     SOCKET listenSock = socket(AF_INET, SOCK_STREAM, 0);
-    if (listenSock == INVALID_SOCKET) { H->log("multiplayer  ERROR: cannot create socket"); return 1; }
+    if (listenSock == INVALID_SOCKET) {
+        H->log("multiplayer  ERROR: cannot create socket"); return 1;
+    }
     int opt = 1;
     setsockopt(listenSock, SOL_SOCKET, SO_REUSEADDR, (char*)&opt, sizeof(opt));
     sockaddr_in addr = {};
@@ -515,7 +552,8 @@ static DWORD WINAPI ServerThread(LPVOID)
     addr.sin_port = htons((u_short)g_port);
     addr.sin_addr.s_addr = INADDR_ANY;
     if (bind(listenSock, (sockaddr*)&addr, sizeof(addr)) != 0) {
-        H->log("multiplayer  ERROR: bind failed"); closesocket(listenSock); return 1;
+        H->log("multiplayer  ERROR: bind failed");
+        closesocket(listenSock); return 1;
     }
     listen(listenSock, MAX_PLAYERS);
     H->log("multiplayer  server listening on port %d", g_port);
@@ -525,7 +563,10 @@ static DWORD WINAPI ServerThread(LPVOID)
         if (client == INVALID_SOCKET) continue;
 
         EnterCriticalSection(&g_lock);
-        if (g_playerCount >= MAX_PLAYERS) { LeaveCriticalSection(&g_lock); closesocket(client); continue; }
+        if (g_playerCount >= MAX_PLAYERS) {
+            LeaveCriticalSection(&g_lock);
+            closesocket(client); continue;
+        }
 
         int nameLen = 0;
         RecvAll(client, (char*)&nameLen, sizeof(int));
@@ -538,16 +579,20 @@ static DWORD WINAPI ServerThread(LPVOID)
         }
 
         int slot = -1;
-        for (int i = 0; i < MAX_PLAYERS; i++) if (!g_players[i].connected) { slot = i; break; }
+        for (int i = 0; i < MAX_PLAYERS; i++)
+            if (!g_players[i].connected) { slot = i; break; }
 
         if (slot >= 0) {
             g_players[slot].sock = client;
-            g_players[slot].ping = 0; g_players[slot].pingStart = 0;
-            g_players[slot].connected = true; g_players[slot].hasFullSave = false;
+            g_players[slot].ping = 0;
+            g_players[slot].pingStart = 0;
+            g_players[slot].connected = true;
+            g_players[slot].hasFullSave = false;
             g_players[slot].prevSaveDir[0] = 0;
             strncpy(g_players[slot].name, name, 63);
             g_playerCount++;
-            H->log("multiplayer  client connected: %s (%d/%d)", name, g_playerCount, MAX_PLAYERS);
+            H->log("multiplayer  connected: %s (%d/%d)",
+                   name, g_playerCount, MAX_PLAYERS);
             SyncSaveToPlayer(slot);
             CreateThread(NULL, 0, ClientThread, (LPVOID)(intptr_t)slot, 0, NULL);
             CreateThread(NULL, 0, PingThread,   (LPVOID)(intptr_t)slot, 0, NULL);
@@ -561,8 +606,11 @@ static DWORD WINAPI ServerThread(LPVOID)
 
 static DWORD WINAPI WatchThread(LPVOID)
 {
-    HANDLE hWatch = FindFirstChangeNotificationA(g_saveDir, TRUE, FILE_NOTIFY_CHANGE_LAST_WRITE);
-    if (hWatch == INVALID_HANDLE_VALUE) { H->log("multiplayer  ERROR: cannot watch save folder"); return 1; }
+    HANDLE hWatch = FindFirstChangeNotificationA(
+        g_saveDir, TRUE, FILE_NOTIFY_CHANGE_LAST_WRITE);
+    if (hWatch == INVALID_HANDLE_VALUE) {
+        H->log("multiplayer  ERROR: cannot watch save folder"); return 1;
+    }
     H->log("multiplayer  watching save folder...");
     while (true) {
         if (WaitForSingleObject(hWatch, INFINITE) == WAIT_OBJECT_0) {
@@ -579,24 +627,32 @@ extern "C" __declspec(dllexport) unsigned TsmPluginApiVersion(void)
     return TSM_API_VERSION;
 }
 
-extern "C" __declspec(dllexport) int TsmPluginInit(const TsmHost* host, TsmPluginInfo* info)
+extern "C" __declspec(dllexport) int TsmPluginInit(
+    const TsmHost* host, TsmPluginInfo* info)
 {
     H = host;
     info->name    = "multiplayer";
-    info->version = "0.3.0";
-    if (!H->configInt("plugins\\multiplayer.ini", "multiplayer", "enabled", 1)) return 1;
-    H->configString("plugins\\multiplayer.ini", "multiplayer", "mode",      g_mode,       sizeof(g_mode),       "host");
-    H->configString("plugins\\multiplayer.ini", "multiplayer", "host_ip",   g_hostIp,     sizeof(g_hostIp),     "127.0.0.1");
-    H->configString("plugins\\multiplayer.ini", "multiplayer", "name",      g_playerName, sizeof(g_playerName), "Player");
-    H->configString("plugins\\multiplayer.ini", "multiplayer", "save_dir",  g_saveDir,    sizeof(g_saveDir),    "media_soviet/save");
-    H->configString("plugins\\multiplayer.ini", "multiplayer", "sync_dir",  g_syncDir,    sizeof(g_syncDir),    "mp_sync");
+    info->version = "0.3.2";
+    if (!H->configInt("plugins\\multiplayer.ini", "multiplayer", "enabled", 1))
+        return 1;
+    H->configString("plugins\\multiplayer.ini", "multiplayer", "mode",
+                    g_mode, sizeof(g_mode), "host");
+    H->configString("plugins\\multiplayer.ini", "multiplayer", "host_ip",
+                    g_hostIp, sizeof(g_hostIp), "127.0.0.1");
+    H->configString("plugins\\multiplayer.ini", "multiplayer", "name",
+                    g_playerName, sizeof(g_playerName), "Player");
+    H->configString("plugins\\multiplayer.ini", "multiplayer", "save_dir",
+                    g_saveDir, sizeof(g_saveDir), "media_soviet/save");
+    H->configString("plugins\\multiplayer.ini", "multiplayer", "sync_dir",
+                    g_syncDir, sizeof(g_syncDir), "mp_sync");
     g_port = H->configInt("plugins\\multiplayer.ini", "multiplayer", "port", 7777);
     memset(g_players, 0, sizeof(g_players));
     for (int i = 0; i < MAX_PLAYERS; i++) {
         g_players[i].sock = INVALID_SOCKET;
         InitializeCriticalSection(&g_players[i].netLock);
     }
-    H->log("multiplayer  v0.3.0 loaded OK (mode: %s, name: %s)", g_mode, g_playerName);
+    H->log("multiplayer  v0.3.2 loaded OK (mode: %s, name: %s)",
+           g_mode, g_playerName);
     return 0;
 }
 
@@ -611,9 +667,9 @@ extern "C" __declspec(dllexport) int TsmPluginStart(void)
     g_watchThread  = CreateThread(NULL, 0, WatchThread,  NULL, 0, NULL);
 
     if (InstallBuildHook())
-        H->log("multiplayer  v0.3.0 realtime hook ACTIVE");
+        H->log("multiplayer  v0.3.2 realtime hook ACTIVE");
     else
-        H->log("multiplayer  v0.3.0 realtime hook FAILED - save-sync only");
+        H->log("multiplayer  v0.3.2 realtime hook FAILED - save-sync only");
 
     return 0;
 }
