@@ -18,22 +18,20 @@
 #include "imgui_impl_win32.h"
 #include "imgui_impl_dx11.h"
 #include <shlobj.h>
+#include "mp_shared.h"
 #include "zstd.h"
 extern "C" {
 #include "bspatch.h"
 }
 
 #ifdef __cplusplus
-// restore C++ linkage
+
 #endif
 
 #pragma comment(lib,"ws2_32.lib")
 #pragma comment(lib,"d3d11.lib")
 #pragma comment(lib,"dxgi.lib")
 
-// ═══════════════════════════════════════════════════════
-//  PROTOCOL
-// ═══════════════════════════════════════════════════════
 #define MSG_SAVE          1
 #define MSG_PING          2
 #define MSG_PONG          3
@@ -66,9 +64,6 @@ struct ResourceReq {
 
 struct PatchStream { const char* buf; size_t pos; size_t size; };
 
-// ═══════════════════════════════════════════════════════
-//  DATA STRUCTURES
-// ═══════════════════════════════════════════════════════
 enum ChatType { CHAT_NORMAL, CHAT_SYSTEM, CHAT_BUILD, CHAT_TRADE, CHAT_ERROR };
 
 struct ChatMsg {
@@ -113,9 +108,6 @@ struct Notification {
     float       alpha;
 };
 
-// ═══════════════════════════════════════════════════════
-//  RESOURCE CATEGORIES
-// ═══════════════════════════════════════════════════════
 struct ResCat { const char* name; const char* kw[20]; };
 static ResCat g_cats[] = {
     {"Raw Materials",   {"rawcoal","rawgravel","rawiron","rawbauxite","rawgold","rawcopper","rawuranium",NULL}},
@@ -131,9 +123,6 @@ static ResCat g_cats[] = {
 };
 static int g_catCount = 10;
 
-// ═══════════════════════════════════════════════════════
-//  PLAYER COLORS
-// ═══════════════════════════════════════════════════════
 static ImVec4 g_playerColors[] = {
     ImVec4(0.90f,0.30f,0.20f,1.f),
     ImVec4(0.20f,0.60f,0.90f,1.f),
@@ -141,18 +130,17 @@ static ImVec4 g_playerColors[] = {
     ImVec4(0.90f,0.70f,0.10f,1.f),
 };
 
-// ═══════════════════════════════════════════════════════
-//  APP STATE
-// ═══════════════════════════════════════════════════════
+static SharedMemory g_shm;
+static bool g_shmConnected = false;
+
 struct AppState {
-    // -- Connection settings --
+
     char ip[64]   = "127.0.0.1";
     char port[8]  = "7777";
     char name[64] = "Player1";
     bool isHost   = true;
     bool isCoopMode = true;
 
-    // -- Network --
     SOCKET        sock        = INVALID_SOCKET;
     HANDLE        recvThread  = NULL;
     CRITICAL_SECTION sendLock;
@@ -161,13 +149,11 @@ struct AppState {
     bool          connected    = false;
     std::string   statusText   = "Not connected";
 
-    // -- Sync progress --
     int  progressCur = 0;
     int  progressMax = 0;
     bool syncing     = false;
     std::string syncStatus;
 
-    // -- Data --
     std::vector<PlayerInfo>   players;
     std::vector<ChatMsg>      chat;
     std::vector<BuildLog>     builds;
@@ -176,7 +162,6 @@ struct AppState {
     std::vector<std::string>  allResources;
     std::vector<std::string>  catResources;
 
-    // -- UI state --
     int   tab          = 0;
     char  chatInput[256] = {};
     int   selectedCat  = 0;
@@ -193,16 +178,12 @@ struct AppState {
     bool  showSettings = false;
     bool  showAbout    = false;
 
-    // -- Stats --
     int totalBuilds   = 0;
     int totalMessages = 0;
     int totalDeals    = 0;
     double sessionStart = 0;
 } g;
 
-// ═══════════════════════════════════════════════════════
-//  DX11
-// ═══════════════════════════════════════════════════════
 static ID3D11Device*           g_dev    = NULL;
 static ID3D11DeviceContext*    g_ctx    = NULL;
 static IDXGISwapChain*         g_chain  = NULL;
@@ -212,9 +193,6 @@ static bool                    g_running = true;
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND,UINT,WPARAM,LPARAM);
 
-// ═══════════════════════════════════════════════════════
-//  NETWORK HELPERS
-// ═══════════════════════════════════════════════════════
 static bool NetSend(SOCKET s,const char* b,int n)
 {
     int sent=0;
@@ -242,9 +220,6 @@ static void NetSendMsg(SOCKET s,BYTE type,const void* data,DWORD sz)
     LeaveCriticalSection(&g.sendLock);
 }
 
-// ═══════════════════════════════════════════════════════
-//  FILE HELPERS
-// ═══════════════════════════════════════════════════════
 static const char* g_saveDir =
     "C:\\Program Files (x86)\\Steam\\steamapps\\common\\"
     "SovietRepublic\\media_soviet\\save\\mp_client";
@@ -298,9 +273,6 @@ static void RecvDiff(SOCKET s,const char* path)
     free(rd);free(od);free(nd);
 }
 
-// ═══════════════════════════════════════════════════════
-//  RESOURCES
-// ═══════════════════════════════════════════════════════
 static bool ResInCat(const std::string& nm,int cat)
 {
     if(cat==g_catCount-1){
@@ -356,9 +328,6 @@ static void FilterCat(int cat)
     }
 }
 
-// ═══════════════════════════════════════════════════════
-//  CHAT & NOTIFICATIONS
-// ═══════════════════════════════════════════════════════
 static void AddChat(const std::string& text, ChatType type=CHAT_NORMAL)
 {
     ChatMsg m; m.text=text; m.type=type;
@@ -377,9 +346,6 @@ static void AddNotif(const std::string& text,
         g.notifications.erase(g.notifications.begin());
 }
 
-// ═══════════════════════════════════════════════════════
-//  RECV THREAD
-// ═══════════════════════════════════════════════════════
 static DWORD WINAPI RecvThread(LPVOID)
 {
     while(g.connected){
@@ -409,7 +375,7 @@ static DWORD WINAPI RecvThread(LPVOID)
                 bl.timestamp=ImGui::GetTime();
                 g.builds.push_back(bl);
                 g.totalBuilds++;
-                // update player build count
+
                 for(auto& p:g.players)
                     if(p.name==c.playerName)p.builds++;
                 char buf[256];
@@ -475,41 +441,19 @@ static DWORD WINAPI RecvThread(LPVOID)
     return 0;
 }
 
-// ═══════════════════════════════════════════════════════
-//  CONNECT / DISCONNECT
-// ═══════════════════════════════════════════════════════
 static void DoConnect()
 {
-    WSADATA w; WSAStartup(MAKEWORD(2,2),&w);
-    g.sock=socket(AF_INET,SOCK_STREAM,0);
-    sockaddr_in a={};a.sin_family=AF_INET;
-    a.sin_port=htons((u_short)atoi(g.port));
-    inet_pton(AF_INET,g.ip,&a.sin_addr);
-    g.statusText="Connecting...";
-    if(connect(g.sock,(sockaddr*)&a,sizeof(a))!=0){
-        g.statusText="Connection failed — check IP and port";
-        closesocket(g.sock);g.sock=INVALID_SOCKET;
-        AddChat("[ERROR] Connection failed",CHAT_ERROR);return;
+    if (g_shmConnected && g_shm.block) {
+        g.statusText = "Connecting...";
+        AddChat("[SYSTEM] Sending connect command to plugin...", CHAT_SYSTEM);
+        g_shm.SendCommand(MP_CMD_CONNECT, g.ip, g.port, g.name);
+        g.sessionStart = ImGui::GetTime();
+        AddNotif("Connect command sent!", ImVec4(0.9f,0.7f,0.1f,1.f));
+    } else {
+        AddChat("[ERROR] Plugin not found — is the game running?", CHAT_ERROR);
+        g.statusText = "Plugin not connected";
+        AddNotif("Plugin not found!", ImVec4(0.9f,0.3f,0.2f,1.f));
     }
-    int nl=(int)strlen(g.name)+1;
-    EnterCriticalSection(&g.sendLock);
-    NetSend(g.sock,(char*)&nl,4);
-    NetSend(g.sock,g.name,nl);
-    LeaveCriticalSection(&g.sendLock);
-    g.connected=true;
-    g.statusText="Connected";
-    g.sessionStart=ImGui::GetTime();
-    PlayerInfo pi;
-    pi.name=g.name; pi.ping=0; pi.connected=true;
-    pi.builds=0; pi.hasTerr=false;
-    pi.color=g_playerColors[g.players.size()%4];
-    g.players.push_back(pi);
-    char buf[128];
-    snprintf(buf,128,"[SYSTEM] Connected as %s to %s:%s",g.name,g.ip,g.port);
-    AddChat(buf,CHAT_SYSTEM);
-    AddNotif("Connected!",ImVec4(0.3f,0.9f,0.3f,1.f));
-    g.recvThread=CreateThread(NULL,0,RecvThread,NULL,0,NULL);
-    SetTimer(g_hwnd,1,5000,NULL);
 }
 static void DoDisconnect()
 {
@@ -527,11 +471,13 @@ static void DoDisconnect()
 }
 static void DoSendChat()
 {
-    if(!g.connected||!g.chatInput[0])return;
-    char full[320];
-    snprintf(full,320,"[%s]: %s",g.name,g.chatInput);
-    NetSendMsg(g.sock,MSG_CHAT,full,(DWORD)strlen(full));
-    AddChat(full,CHAT_NORMAL);
+    if(!g.chatInput[0])return;
+    if (g_shmConnected && g_shm.block) {
+        g_shm.SendCommand(MP_CMD_CHAT, g.chatInput);
+        char full[320];
+        snprintf(full,320,"[%s]: %s",g.name,g.chatInput);
+        AddChat(full,CHAT_NORMAL);
+    }
     g.chatInput[0]='\0';
     ImGui::SetKeyboardFocusHere(-1);
 }
@@ -559,9 +505,6 @@ static void DoSendRequest()
     AddNotif("Request sent!",ImVec4(0.9f,0.7f,0.1f,1.f));
 }
 
-// ═══════════════════════════════════════════════════════
-//  THEME
-// ═══════════════════════════════════════════════════════
 static void ApplyTheme()
 {
     ImGuiStyle& s=ImGui::GetStyle();
@@ -615,9 +558,6 @@ static void ApplyTheme()
     c[ImGuiCol_PlotHistogram]     =ImVec4(0.75f,0.25f,0.15f,1.f);
 }
 
-// ═══════════════════════════════════════════════════════
-//  HELPERS
-// ═══════════════════════════════════════════════════════
 static ImVec4 ChatColor(ChatType t)
 {
     switch(t){
@@ -637,7 +577,7 @@ static void SectionHeader(const char* label)
 }
 static void PingBar(DWORD ping, float width=40.f)
 {
-    // Draw 4 bars like signal strength
+
     ImDrawList* dl=ImGui::GetWindowDrawList();
     ImVec2 p=ImGui::GetCursorScreenPos();
     float barW=6.f, gap=2.f;
@@ -673,19 +613,62 @@ static std::string SessionDuration()
     return buf;
 }
 
-// ═══════════════════════════════════════════════════════
-//  TAB: MAIN
-// ═══════════════════════════════════════════════════════
+static void PollSharedMemory()
+{
+    if (!g_shmConnected) {
+        if (g_shm.Create(false)) {
+            if (g_shm.block && g_shm.block->magic == SHARED_MAGIC) {
+                g_shmConnected = true;
+                AddChat("[SYSTEM] Plugin connected via shared memory", CHAT_SYSTEM);
+                AddNotif("Plugin found!", ImVec4(0.3f,0.9f,0.3f,1.f));
+            }
+        }
+        return;
+    }
+    if (!g_shm.block) return;
+    if (!g_shm.Lock(50)) return;
+    BYTE status = g_shm.block->status;
+    std::string statusText = g_shm.block->statusText;
+    DWORD playerCount = g_shm.block->playerCount;
+    g.players.clear();
+    for (DWORD i = 0; i < playerCount && i < 4; i++) {
+        auto& ps = g_shm.block->players[i];
+        if (!ps.connected) continue;
+        PlayerInfo pi;
+        pi.name = ps.name; pi.ping = ps.ping;
+        pi.connected = true; pi.builds = 0; pi.hasTerr = false;
+        pi.color = g_playerColors[i % 4];
+        g.players.push_back(pi);
+    }
+    static DWORD s_lastBuild = 0;
+    DWORD notifCount = g_shm.block->buildNotifyCount;
+    if (notifCount > s_lastBuild) {
+        for (DWORD i = s_lastBuild; i < notifCount; i++) {
+            auto& bn = g_shm.block->buildNotify[i % MAX_BUILD_NOTIFY];
+            BuildLog bl;
+            bl.player = bn.playerName; bl.type = bn.typeName;
+            bl.x = bn.x; bl.z = bn.z; bl.timestamp = ImGui::GetTime();
+            g.builds.push_back(bl);
+            char msg[256];
+            snprintf(msg,256,"[BUILD] %s placed %s at (%.0f,%.0f)",
+                     bn.playerName,bn.typeName,bn.x,bn.z);
+            AddChat(msg, CHAT_BUILD);
+        }
+        s_lastBuild = notifCount;
+    }
+    g_shm.Unlock();
+    g.statusText = statusText;
+    g.connected = (status == MP_STATUS_CONNECTED || status == MP_STATUS_HOST);
+}
+
 static void TabMain()
 {
     float W=ImGui::GetContentRegionAvail().x;
 
-    // ── Connection block ─────────────────────────────
     ImGui::PushStyleColor(ImGuiCol_ChildBg,ImVec4(0.10f,0.10f,0.14f,1.f));
     float connH = g.connected ? 86.f : 148.f;
     ImGui::BeginChild("##conn",ImVec2(W,connH),true);
 
-    // Status row
     bool ok=g.connected;
     ImU32 dotCol=ok?IM_COL32(60,210,80,255):IM_COL32(200,60,60,255);
     ImDrawList* dl=ImGui::GetWindowDrawList();
@@ -703,7 +686,7 @@ static void TabMain()
 
     if(!ok){
         ImGui::Spacing();
-        // Mode row
+
         ImGui::Text("Mode:");ImGui::SameLine(60);
         if(ImGui::RadioButton("Host",g.isHost)) g.isHost=true;
         ImGui::SameLine();
@@ -748,17 +731,15 @@ static void TabMain()
     ImGui::PopStyleColor();
     ImGui::Spacing();
 
-    // ── Players + Builds side by side ────────────────
     float half=(W-6)*0.5f;
 
-    // Players panel
     ImGui::BeginChild("##players",ImVec2(half,130),true);
     SectionHeader("Players Online");
     if(g.players.empty()){
         ImGui::TextDisabled("  No players");
     } else {
         for(auto& p:g.players){
-            // Colored dot
+
             ImDrawList* pdl=ImGui::GetWindowDrawList();
             ImVec2 pp=ImGui::GetCursorScreenPos();
             ImU32 pc=IM_COL32((int)(p.color.x*255),(int)(p.color.y*255),
@@ -778,7 +759,6 @@ static void TabMain()
 
     ImGui::SameLine(0,6);
 
-    // Recent builds panel
     ImGui::BeginChild("##recentbuilds",ImVec2(half,130),true);
     SectionHeader("Recent Builds");
     int bn=(int)g.builds.size();
@@ -797,7 +777,6 @@ static void TabMain()
 
     ImGui::Spacing();
 
-    // ── Chat ─────────────────────────────────────────
     float chatH=ImGui::GetContentRegionAvail().y-34.f;
     if(chatH<60)chatH=60;
     ImGui::PushStyleColor(ImGuiCol_ChildBg,ImVec4(0.08f,0.08f,0.11f,1.f));
@@ -810,7 +789,6 @@ static void TabMain()
     ImGui::EndChild();
     ImGui::PopStyleColor();
 
-    // Chat input
     ImGui::SetNextItemWidth(W-56);
     bool enter=ImGui::InputText("##ci",g.chatInput,256,
                                 ImGuiInputTextFlags_EnterReturnsTrue);
@@ -819,15 +797,11 @@ static void TabMain()
         DoSendChat();
 }
 
-// ═══════════════════════════════════════════════════════
-//  TAB: IMPORT
-// ═══════════════════════════════════════════════════════
 static void TabImport()
 {
     float W=ImGui::GetContentRegionAvail().x;
     float half=(W-6)*0.5f;
 
-    // ── Category + Resource pickers ──────────────────
     ImGui::BeginChild("##catpick",ImVec2(half,220),true);
     SectionHeader("Category");
     for(int i=0;i<g_catCount;i++){
@@ -859,7 +833,6 @@ static void TabImport()
 
     ImGui::Spacing();
 
-    // ── Request form ─────────────────────────────────
     ImGui::PushStyleColor(ImGuiCol_ChildBg,ImVec4(0.10f,0.10f,0.14f,1.f));
     ImGui::BeginChild("##reqform",ImVec2(W,90),true);
     SectionHeader("Send Request");
@@ -887,14 +860,13 @@ static void TabImport()
 
     ImGui::Spacing();
 
-    // ── Deals list ───────────────────────────────────
     ImGui::BeginChild("##deals",ImVec2(W,0),true);
     SectionHeader("Resource Deals");
 
     if(g.deals.empty()){
         ImGui::TextDisabled("  No deals yet");
     } else {
-        // Headers
+
         ImGui::Columns(5,"dealcols",true);
         ImGui::SetColumnWidth(0,80);
         ImGui::SetColumnWidth(1,80);
@@ -918,7 +890,7 @@ static void TabImport()
                 ImGui::PushStyleColor(ImGuiCol_Text,ImVec4(0.9f,0.7f,0.1f,1.f));
                 ImGui::Text("Pending");
                 ImGui::PopStyleColor();
-                // Accept / decline buttons if it's for us
+
                 if(d.to==g.name||d.to.empty()){
                     ImGui::SameLine();
                     ImGui::PushStyleColor(ImGuiCol_Button,ImVec4(0.15f,0.55f,0.20f,1.f));
@@ -952,20 +924,16 @@ static void TabImport()
     ImGui::EndChild();
 }
 
-// ═══════════════════════════════════════════════════════
-//  TAB: BUILDINGS
-// ═══════════════════════════════════════════════════════
 static void TabBuildings()
 {
     float W=ImGui::GetContentRegionAvail().x;
 
-    // Stats row
     ImGui::BeginChild("##bstats",ImVec2(W,44),true);
     ImGui::Columns(3,"bstatscols",false);
     ImGui::TextDisabled("Total placed:");ImGui::SameLine();
     ImGui::Text("%d",(int)g.builds.size());
     ImGui::NextColumn();
-    // Most active player
+
     std::map<std::string,int> cnts;
     for(auto& b:g.builds)cnts[b.player]++;
     std::string topPlayer; int topCnt=0;
@@ -983,7 +951,6 @@ static void TabBuildings()
 
     ImGui::Spacing();
 
-    // Build log
     ImGui::BeginChild("##buildlog",ImVec2(W,0),true);
     SectionHeader("Build History");
 
@@ -1013,7 +980,7 @@ static void TabBuildings()
                 std::transform(lo.begin(),lo.end(),lo.begin(),::tolower);
                 if(lo.find(flt)==std::string::npos)continue;
             }
-            // find player color
+
             ImVec4 pc=ImVec4(0.9f,0.4f,0.2f,1.f);
             for(int pi=0;pi<(int)g.players.size();pi++)
                 if(g.players[pi].name==b.player){pc=g.players[pi].color;break;}
@@ -1029,15 +996,11 @@ static void TabBuildings()
     ImGui::EndChild();
 }
 
-// ═══════════════════════════════════════════════════════
-//  TAB: MAP
-// ═══════════════════════════════════════════════════════
 static void TabMap()
 {
     float W=ImGui::GetContentRegionAvail().x;
     float H=ImGui::GetContentRegionAvail().y;
 
-    // Controls row
     ImGui::BeginChild("##mapctrl",ImVec2(W,32),false);
     ImGui::Text("Zoom:");ImGui::SameLine();
     ImGui::SetNextItemWidth(100);
@@ -1050,18 +1013,15 @@ static void TabMap()
     ImGui::TextDisabled("Buildings: %d",(int)g.builds.size());
     ImGui::EndChild();
 
-    // Canvas
     ImVec2 cpos=ImGui::GetCursorScreenPos();
     ImVec2 csz=ImVec2(W,H-36);
     ImDrawList* dl=ImGui::GetWindowDrawList();
 
-    // Background
     dl->AddRectFilled(cpos,ImVec2(cpos.x+csz.x,cpos.y+csz.y),
                       IM_COL32(14,22,14,255));
     dl->AddRect(cpos,ImVec2(cpos.x+csz.x,cpos.y+csz.y),
                 IM_COL32(45,70,45,200));
 
-    // Grid
     int gridN=8;
     for(int i=1;i<gridN;i++){
         float gx=cpos.x+csz.x*i/gridN;
@@ -1070,7 +1030,6 @@ static void TabMap()
         dl->AddLine(ImVec2(cpos.x,gy),ImVec2(cpos.x+csz.x,gy),IM_COL32(30,45,30,180));
     }
 
-    // Plot builds
     if(!g.builds.empty()){
         float minX=g.builds[0].x,maxX=g.builds[0].x;
         float minZ=g.builds[0].z,maxZ=g.builds[0].z;
@@ -1091,7 +1050,6 @@ static void TabMap()
             IM_COL32(220,180,50,220)
         };
 
-        // Territory rectangles
         for(int pi=0;pi<(int)g.players.size();pi++){
             auto& p=g.players[pi];
             if(!p.hasTerr)continue;
@@ -1108,7 +1066,6 @@ static void TabMap()
             dl->AddRectFilled(ImVec2(rx1,rz1),ImVec2(rx2,rz2),tf);
         }
 
-        // Build dots
         for(auto& b:g.builds){
             float px=cpos.x+pad+(b.x-minX)*scaleX+g.mapOffX;
             float pz=cpos.y+pad+(b.z-minZ)*scaleZ+g.mapOffZ;
@@ -1120,43 +1077,37 @@ static void TabMap()
             dl->AddCircle(ImVec2(px,pz),4.f,IM_COL32(255,255,255,80));
         }
 
-        // Legend
         float lx=cpos.x+8, ly=cpos.y+csz.y-20;
         for(int i=0;i<(int)g.players.size()&&i<4;i++){
             dl->AddCircleFilled(ImVec2(lx+5,ly+6),5,pColors[i]);
             lx+=12;
         }
     } else {
-        // No data
+
         const char* msg="No build data yet";
         ImVec2 ts=ImGui::CalcTextSize(msg);
         dl->AddText(ImVec2(cpos.x+(csz.x-ts.x)*0.5f,cpos.y+(csz.y-ts.y)*0.5f),
                     IM_COL32(60,90,60,255),msg);
     }
 
-    // Drag to pan
     ImGui::InvisibleButton("##mapbtn",csz);
     if(ImGui::IsItemActive()&&ImGui::IsMouseDragging(0)){
         ImVec2 delta=ImGui::GetIO().MouseDelta;
         g.mapOffX+=delta.x;
         g.mapOffZ+=delta.y;
     }
-    // Mouse wheel zoom
+
     if(ImGui::IsItemHovered()){
         float wheel=ImGui::GetIO().MouseWheel;
         if(wheel!=0){g.mapZoom+=wheel*0.15f;g.mapZoom=std::max(0.3f,std::min(8.f,g.mapZoom));}
     }
 }
 
-// ═══════════════════════════════════════════════════════
-//  TAB: STATS
-// ═══════════════════════════════════════════════════════
 static void TabStats()
 {
     float W=ImGui::GetContentRegionAvail().x;
     float half=(W-6)*0.5f;
 
-    // Session stats
     ImGui::BeginChild("##sessionstats",ImVec2(half,150),true);
     SectionHeader("Session");
     ImGui::Text("Status:    ");ImGui::SameLine();
@@ -1187,7 +1138,6 @@ static void TabStats()
 
     ImGui::Spacing();
 
-    // Per-player stats
     ImGui::BeginChild("##playerstats",ImVec2(W,0),true);
     SectionHeader("Player Stats");
     if(g.players.empty()){
@@ -1214,9 +1164,6 @@ static void TabStats()
     ImGui::EndChild();
 }
 
-// ═══════════════════════════════════════════════════════
-//  DX11 SETUP
-// ═══════════════════════════════════════════════════════
 static bool CreateDX11(HWND hwnd)
 {
     DXGI_SWAP_CHAIN_DESC sd={};
@@ -1253,9 +1200,6 @@ static void ResizeDX11(UINT w,UINT h)
     bb->Release();
 }
 
-// ═══════════════════════════════════════════════════════
-//  WNDPROC
-// ═══════════════════════════════════════════════════════
 LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
 {
     if(ImGui_ImplWin32_WndProcHandler(hwnd,msg,wp,lp))return true;
@@ -1278,9 +1222,6 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
     return DefWindowProcA(hwnd,msg,wp,lp);
 }
 
-// ═══════════════════════════════════════════════════════
-//  WINMAIN
-// ═══════════════════════════════════════════════════════
 int WINAPI WinMain(HINSTANCE hInst,HINSTANCE,LPSTR,int)
 {
     InitializeCriticalSection(&g.sendLock);
@@ -1306,7 +1247,6 @@ int WINAPI WinMain(HINSTANCE hInst,HINSTANCE,LPSTR,int)
     io.ConfigFlags|=ImGuiConfigFlags_NavEnableKeyboard;
     io.IniFilename=NULL;
 
-    // Load a slightly larger font for readability
     io.Fonts->AddFontDefault();
 
     ImGui_ImplWin32_Init(g_hwnd);
@@ -1329,6 +1269,7 @@ int WINAPI WinMain(HINSTANCE hInst,HINSTANCE,LPSTR,int)
         }
         if(!g_running)break;
 
+        PollSharedMemory();
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
@@ -1341,12 +1282,11 @@ int WINAPI WinMain(HINSTANCE hInst,HINSTANCE,LPSTR,int)
             ImGuiWindowFlags_NoMove|ImGuiWindowFlags_NoScrollbar|
             ImGuiWindowFlags_NoSavedSettings|ImGuiWindowFlags_NoFocusOnAppearing);
 
-        // ── App header ─────────────────────────────
         ImGui::PushStyleColor(ImGuiCol_Text,ImVec4(0.88f,0.28f,0.18f,1.f));
         ImGui::Text("  WRSR Multiplayer");
         ImGui::PopStyleColor();
         ImGui::SameLine();
-        ImGui::TextDisabled("v0.4.1");
+        ImGui::TextDisabled("v0.4.1  |  Kobel-WRSR");
         ImGui::SameLine(io2.DisplaySize.x-90);
         if(g.connected){
             ImGui::TextColored(ImVec4(0.3f,0.85f,0.3f,1.f),"ONLINE");
@@ -1355,7 +1295,6 @@ int WINAPI WinMain(HINSTANCE hInst,HINSTANCE,LPSTR,int)
         }
         ImGui::Separator();
 
-        // ── Tabs ───────────────────────────────────
         if(ImGui::BeginTabBar("##maintabs",ImGuiTabBarFlags_None)){
             if(ImGui::BeginTabItem("Main"))      {TabMain();     ImGui::EndTabItem();}
             if(ImGui::BeginTabItem("Import"))    {TabImport();   ImGui::EndTabItem();}
@@ -1365,7 +1304,6 @@ int WINAPI WinMain(HINSTANCE hInst,HINSTANCE,LPSTR,int)
             ImGui::EndTabBar();
         }
 
-        // ── Notifications ──────────────────────────
         double now=ImGui::GetTime();
         float ny=io2.DisplaySize.y-16;
         for(int i=(int)g.notifications.size()-1;i>=0;i--){
@@ -1403,6 +1341,7 @@ int WINAPI WinMain(HINSTANCE hInst,HINSTANCE,LPSTR,int)
     CleanDX11();
     DestroyWindow(g_hwnd);
     UnregisterClassA("WRSRMp",hInst);
+    g_shm.Destroy();
     DeleteCriticalSection(&g.sendLock);
     return 0;
 }

@@ -16,8 +16,10 @@ extern "C" {
 #include "bspatch.h"
 }
 
+#include <shlobj.h>
 #include "mp_shared.h"
 #pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "shell32.lib")
 
 #define MP_VERSION_MAJOR  0
 #define MP_VERSION_MINOR  4
@@ -330,6 +332,7 @@ static void BroadcastToAll(BYTE type, const void* data, DWORD size,
 }
 
 static void ClientSendBuild(const BuildCmd* cmd);
+static void ShmAddBuildNotify(const BuildCmd* cmd);
 
 static void BroadcastBuild(const BuildCmd* cmd)
 {
@@ -1403,6 +1406,11 @@ static void ShmAddBuildNotify(const BuildCmd* cmd)
 static DWORD WINAPI ShmControlThread(LPVOID)
 {
     H->log("multiplayer  shm control thread started");
+    Sleep(500);
+    if (!g_shm.block || g_shm.block->magic != SHARED_MAGIC) {
+        H->log("multiplayer  shm block invalid, exiting control thread");
+        return 1;
+    }
 
     while (true) {
         if (g_shm.HasCommand()) {
@@ -1549,8 +1557,15 @@ extern "C" __declspec(dllexport) int TsmPluginStart(void)
 
     if (g_shm.Create(true)) {
         H->log("multiplayer  shared memory created: %s", MP_SHARED_NAME);
-        g_shm.block->pluginVersion =
-            (MP_VERSION_MAJOR << 16) | (MP_VERSION_MINOR << 8) | MP_VERSION_PATCH;
+        __try {
+            g_shm.block->pluginVersion =
+                (MP_VERSION_MAJOR << 16) | (MP_VERSION_MINOR << 8) | MP_VERSION_PATCH;
+            g_shm.block->status = MP_STATUS_OFFLINE;
+            g_shm.block->playerCount = 0;
+            g_shm.block->buildNotifyCount = 0;
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+            H->log("multiplayer  shm block init failed");
+        }
         g_shmThread = CreateThread(NULL, 0, ShmControlThread, NULL, 0, NULL);
     } else {
         H->log("multiplayer  shared memory failed (non-fatal)");

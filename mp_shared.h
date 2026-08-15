@@ -2,7 +2,7 @@
 #include <windows.h>
 
 #define MP_SHARED_NAME    "WRSRMp_Control"
-#define MP_SHARED_SIZE    4096
+#define MP_SHARED_SIZE    16384
 #define MP_MUTEX_NAME     "WRSRMp_Mutex"
 #define MP_EVENT_CMD      "WRSRMp_CmdEvent"
 #define MP_EVENT_STATUS   "WRSRMp_StatusEvent"
@@ -35,7 +35,7 @@ struct BuildNotify {
     DWORD timestamp;
 };
 
-#define MAX_BUILD_NOTIFY 32
+#define MAX_BUILD_NOTIFY 16
 
 struct SharedBlock {
     DWORD   magic;
@@ -85,7 +85,11 @@ public:
             hMap = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL,
                 PAGE_READWRITE, 0, MP_SHARED_SIZE, MP_SHARED_NAME);
         } else {
-            hMap = OpenFileMappingA(FILE_MAP_ALL_ACCESS, FALSE, MP_SHARED_NAME);
+            for (int attempt = 0; attempt < 3; attempt++) {
+                hMap = OpenFileMappingA(FILE_MAP_ALL_ACCESS, FALSE, MP_SHARED_NAME);
+                if (hMap) break;
+                Sleep(500);
+            }
         }
         if (!hMap) return false;
 
