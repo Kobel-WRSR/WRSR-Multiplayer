@@ -1286,7 +1286,7 @@ int WINAPI WinMain(HINSTANCE hInst,HINSTANCE,LPSTR,int)
         ImGui::Text("  WRSR Multiplayer");
         ImGui::PopStyleColor();
         ImGui::SameLine();
-        ImGui::TextDisabled("v0.4.1  |  Kobel-WRSR");
+        ImGui::TextDisabled("v0.4.1  |  Kobel");
         ImGui::SameLine(io2.DisplaySize.x-90);
         if(g.connected){
             ImGui::TextColored(ImVec4(0.3f,0.85f,0.3f,1.f),"ONLINE");
