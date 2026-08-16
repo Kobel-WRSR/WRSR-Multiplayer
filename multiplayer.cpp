@@ -24,7 +24,7 @@ extern "C" {
 
 #define MP_VERSION_MAJOR     0
 #define MP_VERSION_MINOR     7
-#define MP_VERSION_PATCH     0
+#define MP_VERSION_PATCH     1
 #define MP_PROTOCOL_VER      4
 
 #define MSG_SAVE             1
@@ -1533,9 +1533,9 @@ static void ShmUpdateStatus()
 {
     if(!g_shm.block||!g_shm.Lock())return;
     if(strcmp(g_mode,"host")==0){
-        g_shm.block->status=(g_playerCount>0)?MP_STATUS_HOST:MP_STATUS_CONNECTED;
-        snprintf(g_shm.block->statusText,255,"Host | %d/%d players | port %d | uptime %us",
-                 g_playerCount,g_maxPlayers,g_port,(DWORD)((GetTickCount64()-g_sessionStart)/1000));
+        g_shm.block->status=MP_STATUS_HOST;
+        snprintf(g_shm.block->statusText,255,"Host %d/%d | port %d | up %us",
+                 g_playerCount,(int)g_maxPlayers,g_port,(DWORD)((GetTickCount64()-g_sessionStart)/1000));
     } else {
         g_shm.block->status=g_clientConnected?MP_STATUS_CONNECTED:MP_STATUS_OFFLINE;
         if(g_clientConnected)snprintf(g_shm.block->statusText,255,"Connected to %s:%d | ping %ums",g_hostIp,g_port,g_clientPing);
@@ -1632,7 +1632,7 @@ extern "C" __declspec(dllexport) unsigned TsmPluginApiVersion(void){return TSM_A
 
 extern "C" __declspec(dllexport) int TsmPluginInit(const TsmHost* host, TsmPluginInfo* info)
 {
-    H=host;info->name="multiplayer";info->version="0.7.0";
+    H=host;info->name="multiplayer";info->version = "0.7.1";
     if(!H->configInt("plugins\\multiplayer.ini","multiplayer","enabled",1))return 1;
     H->configString("plugins\\multiplayer.ini","multiplayer","mode",g_mode,sizeof(g_mode),"host");
     H->configString("plugins\\multiplayer.ini","multiplayer","host_ip",g_hostIp,sizeof(g_hostIp),"127.0.0.1");
