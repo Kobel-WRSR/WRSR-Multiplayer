@@ -203,7 +203,7 @@ struct Strings {
 
 static const Strings g_str[2] = {
 {
-    "WRSR Multiplayer  v0.7",
+    "WRSR Multiplayer  v0.8",
     "Main","Import","Buildings","Map","Stats","Admin","Settings",
     "Plugin:","Network:",
     "Game running","Waiting for game...",
@@ -239,7 +239,7 @@ static const Strings g_str[2] = {
     "(select resource)"
 },
 {
-    "WRSR Мультиплеер  v0.7",
+    "WRSR Мультиплеер  v0.8",
     "Главная","Импорт","Здания","Карта","Статы","Админ","Настройки",
     "Плагин:","Сеть:",
     "Игра запущена","Ожидание игры...",
@@ -931,8 +931,8 @@ static void PollSharedMemory()
     if(!g_userDisconnected){
         bool isHost=(g_pluginStatus==MP_STATUS_HOST);
         bool isConn=(g_pluginStatus==MP_STATUS_CONNECTED);
-        bool isStandby=(g_pluginStatus!=MP_STATUS_OFFLINE);
-        g_networkOnline=(isHost||isConn||(g.isHost&&isStandby));
+        bool serverMode=g.isHost&&(g_pluginStatus!=MP_STATUS_OFFLINE);
+        g_networkOnline=(isHost||isConn||serverMode);
         g.connected=g_networkOnline;
         if(g_networkOnline&&g.sessionStart<=0)g.sessionStart=ImGui::GetTime();
     } else {g_networkOnline=false;g.connected=false;}
@@ -1057,6 +1057,7 @@ static void TabMain()
         std::string dur=SessionDuration();
         if(!dur.empty())ImGui::TextDisabled("  %s",dur.c_str());
         if(g.ping>0){ImGui::SameLine(0,16);DrawPingBar(g.ping);}
+        ImGui::SameLine(0,16);ImGui::TextDisabled("[%s]",g.name);
     } else ImGui::TextDisabled("%s",g_pluginStatusText);
     ImGui::EndChild();ImGui::PopStyleColor();ImGui::Spacing();
 
@@ -1095,6 +1096,11 @@ static void TabMain()
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered,ImVec4(0.35f,0.35f,0.45f,1.f));
         if(ImGui::Button(L().btnDisconnect,ImVec2(W-12,24)))DoDisconnect();
         ImGui::PopStyleColor(2);
+        if(g.isHost){
+            ImGui::TextDisabled("  Host | port: %s | %d/%d players",g.port,(int)g.players.size(),4);
+        } else {
+            ImGui::TextDisabled("  Connected to %s:%s",g.ip,g.port);
+        }
     }
     if(g.syncing){
         ImGui::Spacing();
@@ -1712,7 +1718,7 @@ int WINAPI WinMain(HINSTANCE hInst,HINSTANCE,LPSTR,int)
 
         ImGui::PushStyleColor(ImGuiCol_Text,ImVec4(0.88f,0.28f,0.18f,1.f));
         ImGui::Text("  WRSR Multiplayer");ImGui::PopStyleColor();
-        ImGui::SameLine();ImGui::TextDisabled("v0.7");
+        ImGui::SameLine();ImGui::TextDisabled("v0.8");
         ImGui::SameLine(io2.DisplaySize.x-100);
         if(g_networkOnline)
             ImGui::TextColored(ImVec4(0.3f,0.85f,0.3f,1.f),"%s",L().statusOnline);

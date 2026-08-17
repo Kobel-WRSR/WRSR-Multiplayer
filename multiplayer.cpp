@@ -23,9 +23,9 @@ extern "C" {
 #pragma comment(lib, "shell32.lib")
 
 #define MP_VERSION_MAJOR     0
-#define MP_VERSION_MINOR     7
-#define MP_VERSION_PATCH     1
-#define MP_PROTOCOL_VER      4
+#define MP_VERSION_MINOR     8
+#define MP_VERSION_PATCH     0
+#define MP_PROTOCOL_VER      5
 
 #define MSG_SAVE             1
 #define MSG_PING             2
@@ -48,10 +48,18 @@ extern "C" {
 #define MSG_STATS_REQ        19
 #define MSG_STATS_RESP       20
 #define MSG_ADMIN            21
+#define MSG_BUILD_APPLY      22
+#define MSG_ROAD_APPLY       23
+#define MSG_WELCOME          24
+#define MSG_PLAYER_JOIN      25
+#define MSG_PLAYER_LEAVE     26
 
 #define HOOK_BUILD_RVA       0x6F8CC0
 #define HOOK_PLACE_RVA       0x4461F0
-#define HOOK_DEMOL_RVA       0x6F8E00
+#define HOOK_DEMOL_RVA       0x7FC880
+#define HOOK_ROAD_RVA        0x786BE0
+#define HOOK_PIPE_RVA        0x000000
+#define HOOK_RAIL_RVA        0x000000
 
 #define MAX_PLAYERS              4
 #define MAX_BUILD_LOG          512
@@ -82,6 +90,7 @@ struct HandshakePacket {
     BYTE  versionPatch;
     char  playerName[64];
     char  gameMode[16];
+    char  password[64];
     DWORD flags;
 };
 
@@ -108,14 +117,22 @@ struct RoadCmd {
     char  roadType[64];
     char  playerName[64];
     DWORD timestamp;
+    DWORD sequenceId;
     BYTE  flags;
+    BYTE  category;
 };
+
+#define ROAD_CAT_ROAD  0
+#define ROAD_CAT_PIPE  1
+#define ROAD_CAT_RAIL  2
+#define ROAD_CAT_WIRE  3
 
 struct PlayerListEntry {
     char  name[64];
     DWORD ping;
     DWORD buildCount;
     DWORD bytesReceived;
+    DWORD color;
     BYTE  connected;
     BYTE  isHost;
     BYTE  slot;
@@ -217,13 +234,21 @@ typedef void (*BuildHandlerFn)(__int64, char*);
 typedef void (*PlaceHandlerFn)(void*, float, float, int);
 typedef void (*DemolHandlerFn)(__int64, char*);
 
+typedef void (*RoadHandlerFn)(void*, float, float, float, float, int);
+
 static BuildHandlerFn g_origBuildHandler = nullptr;
 static PlaceHandlerFn g_origPlaceHandler = nullptr;
 static DemolHandlerFn g_origDemolHandler = nullptr;
+static RoadHandlerFn  g_origRoadHandler  = nullptr;
+static RoadHandlerFn  g_origPipeHandler  = nullptr;
+static RoadHandlerFn  g_origRailHandler  = nullptr;
 
 static BYTE g_buildOrigBytes[16] = {0};
 static BYTE g_placeOrigBytes[16] = {0};
 static BYTE g_demolOrigBytes[16] = {0};
+static BYTE g_roadOrigBytes[16]  = {0};
+static BYTE g_pipeOrigBytes[16]  = {0};
+static BYTE g_railOrigBytes[16]  = {0};
 
 static HMODULE g_hExe = nullptr;
 
@@ -252,7 +277,15 @@ struct Player {
     DWORD             packetsSent;
     DWORD             packetsRecv;
     DWORD             slot;
+    DWORD             color;
     TerritoryInfo     territory;
+};
+
+static const DWORD g_slotColors[MAX_PLAYERS] = {
+    0xFFE64B32,
+    0xFF3C8CDC,
+    0xFF32C850,
+    0xFFDCB432,
 };
 
 #define DEDUP_HISTORY 64
@@ -300,6 +333,9 @@ static char g_password[64];
 static int  g_port               = 7777;
 static bool g_enableDemolishSync = true;
 static bool g_enableRoadSync     = false;
+static bool g_enablePipeSync     = false;
+static bool g_enableRailSync     = false;
+static bool g_enableWireSync     = false;
 static bool g_enableAntiSpam     = true;
 static bool g_enableTerritories  = false;
 static bool g_enableSessionLog   = true;
@@ -319,6 +355,7 @@ static char           g_lastTypeName[128]  = {0};
 static volatile bool  g_inBuildMode        = false;
 static DWORD          g_sequenceId         = 0;
 static DWORD          g_demolSequenceId    = 0;
+static DWORD          g_roadSequenceId     = 0;
 
 static SharedMemory   g_shm;
 static HANDLE         g_shmThread = NULL;
@@ -407,6 +444,268 @@ static void FlushSessionLog()
     LeaveCriticalSection(&g_buildLogLock);
     CloseHandle(h);
     H->log("multiplayer  session log written: %d builds", g_buildLogCount);
+}
+
+struct PlayerTally {
+    char  name[64];
+    int   builds, demolishes, roads, chats;
+};
+static int JournalTally(PlayerTally* out,int maxOut);
+
+static void WriteStatusHtml()
+{
+    char path[MAX_PATH];
+    snprintf(path, MAX_PATH, "%s\\mp_status.html", g_logDir);
+    HANDLE h = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+    if (h == INVALID_HANDLE_VALUE) return;
+    DWORD up = (DWORD)((GetTickCount64() - g_sessionStart) / 1000);
+    int uh = up/3600, um = (up%3600)/60, us = up%60;
+    char buf[4096];
+    int len = snprintf(buf, sizeof(buf),
+        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+        "<meta http-equiv='refresh' content='5'>"
+        "<title>WRSR Multiplayer Server</title>"
+        "<style>body{background:#12121a;color:#e0ded8;font-family:monospace;padding:20px}"
+        "h1{color:#d9472e}table{border-collapse:collapse;margin-top:12px}"
+        "td,th{border:1px solid #333;padding:6px 12px;text-align:left}"
+        "th{background:#2a1010;color:#e88}.on{color:#5c5}.off{color:#c55}</style></head><body>"
+        "<h1>WRSR Multiplayer</h1>"
+        "<p>Status: <span class='on'>ONLINE</span> | Uptime: %dh %dm %ds | Port: %d</p>"
+        "<p>Players: %d/%d | Total builds: %u | Total demolitions: %u</p>"
+        "<table><tr><th>Slot</th><th>Player</th><th>Ping</th><th>Builds</th><th>Demolitions</th></tr>",
+        uh, um, us, g_port, g_playerCount, (int)g_maxPlayers,
+        g_totalBuildsSession, g_totalDemolSession);
+    DWORD wr;
+    WriteFile(h, buf, len, &wr, NULL);
+    EnterCriticalSection(&g_lock);
+    for (int i = 0; i < MAX_PLAYERS; i++) {
+        if (!g_players[i].connected) continue;
+        int rlen = snprintf(buf, sizeof(buf),
+            "<tr><td>%d</td><td>%s</td><td>%ums</td><td>%u</td><td>%u</td></tr>",
+            i, g_players[i].name, g_players[i].ping,
+            g_players[i].buildCount, g_players[i].demolishCount);
+        WriteFile(h, buf, rlen, &wr, NULL);
+    }
+    LeaveCriticalSection(&g_lock);
+    const char* midTail = "</table>";
+    WriteFile(h, midTail, (DWORD)strlen(midTail), &wr, NULL);
+
+    PlayerTally tallies[16];
+    int tn = JournalTally(tallies, 16);
+    if (tn > 0) {
+        const char* th2 = "<h2 style='color:#d9472e'>Activity</h2>"
+            "<table><tr><th>Player</th><th>Builds</th><th>Demolitions</th><th>Roads</th><th>Chats</th></tr>";
+        WriteFile(h, th2, (DWORD)strlen(th2), &wr, NULL);
+        for (int i = 0; i < tn; i++) {
+            int rl = snprintf(buf, sizeof(buf),
+                "<tr><td>%s</td><td>%d</td><td>%d</td><td>%d</td><td>%d</td></tr>",
+                tallies[i].name, tallies[i].builds, tallies[i].demolishes,
+                tallies[i].roads, tallies[i].chats);
+            WriteFile(h, buf, rl, &wr, NULL);
+        }
+        const char* te = "</table>";
+        WriteFile(h, te, (DWORD)strlen(te), &wr, NULL);
+    }
+
+    const char* tail = "<p style='color:#666;margin-top:20px'>Auto-refreshes every 5s. "
+                       "Full event log in mp_journal.json</p></body></html>";
+    WriteFile(h, tail, (DWORD)strlen(tail), &wr, NULL);
+    CloseHandle(h);
+}
+
+static bool NameInFile(const char* fileName, const char* playerName)
+{
+    char path[MAX_PATH];
+    snprintf(path, MAX_PATH, "%s\\%s", g_logDir, fileName);
+    HANDLE h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    DWORD sz = GetFileSize(h, NULL);
+    if (sz == 0 || sz > 65536) { CloseHandle(h); return false; }
+    char* data = (char*)malloc(sz + 1);
+    if (!data) { CloseHandle(h); return false; }
+    DWORD rd; ReadFile(h, data, sz, &rd, NULL); CloseHandle(h);
+    data[sz] = 0;
+    bool found = false;
+    char* line = strtok(data, "\r\n");
+    while (line) {
+        while (*line == ' ' || *line == '\t') line++;
+        if (line[0] && line[0] != '#' && _stricmp(line, playerName) == 0) { found = true; break; }
+        line = strtok(NULL, "\r\n");
+    }
+    free(data);
+    return found;
+}
+
+static bool IsFileNonEmpty(const char* fileName)
+{
+    char path[MAX_PATH];
+    snprintf(path, MAX_PATH, "%s\\%s", g_logDir, fileName);
+    HANDLE h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    DWORD sz = GetFileSize(h, NULL);
+    CloseHandle(h);
+    return sz > 0;
+}
+
+static bool IsPlayerAllowed(const char* playerName, char* reasonOut, int reasonCap)
+{
+    if (NameInFile("blacklist.txt", playerName)) {
+        snprintf(reasonOut, reasonCap, "You are blacklisted on this server");
+        return false;
+    }
+    if (IsFileNonEmpty("whitelist.txt") && !NameInFile("whitelist.txt", playerName)) {
+        snprintf(reasonOut, reasonCap, "This server is whitelist-only");
+        return false;
+    }
+    reasonOut[0] = 0;
+    return true;
+}
+
+static bool IsPlayerAdmin(const char* playerName)
+{
+    return NameInFile("admins.txt", playerName);
+}
+
+#define JOURNAL_CAPACITY 256
+
+enum EventKind {
+    EV_JOIN = 0, EV_LEAVE, EV_BUILD, EV_DEMOLISH, EV_ROAD,
+    EV_CHAT, EV_KICK, EV_SAVE_SYNC, EV_ADMIN
+};
+
+struct JournalEntry {
+    DWORD    id;
+    DWORD    timestamp;
+    BYTE     kind;
+    char     player[64];
+    char     detail[96];
+    float    x, z;
+};
+
+static JournalEntry     g_journal[JOURNAL_CAPACITY];
+static DWORD            g_journalHead    = 0;
+static DWORD            g_journalCount   = 0;
+static CRITICAL_SECTION g_journalLock;
+static bool             g_journalInit    = false;
+
+static const char* EventKindName(BYTE k)
+{
+    switch(k){
+        case EV_JOIN:      return "join";
+        case EV_LEAVE:     return "leave";
+        case EV_BUILD:     return "build";
+        case EV_DEMOLISH:  return "demolish";
+        case EV_ROAD:      return "road";
+        case EV_CHAT:      return "chat";
+        case EV_KICK:      return "kick";
+        case EV_SAVE_SYNC: return "save_sync";
+        case EV_ADMIN:     return "admin";
+        default:           return "unknown";
+    }
+}
+
+static void JournalInit()
+{
+    if(g_journalInit)return;
+    InitializeCriticalSection(&g_journalLock);
+    memset(g_journal,0,sizeof(g_journal));
+    g_journalHead=0; g_journalCount=0;
+    g_journalInit=true;
+}
+
+static void JournalAdd(BYTE kind,const char* player,const char* detail,float x,float z)
+{
+    if(!g_journalInit)JournalInit();
+    EnterCriticalSection(&g_journalLock);
+    JournalEntry& e=g_journal[g_journalHead];
+    e.id=g_journalCount;
+    e.timestamp=GetTickCount();
+    e.kind=kind;
+    strncpy(e.player,player?player:"",63); e.player[63]=0;
+    strncpy(e.detail,detail?detail:"",95); e.detail[95]=0;
+    e.x=x; e.z=z;
+    g_journalHead=(g_journalHead+1)%JOURNAL_CAPACITY;
+    g_journalCount++;
+    LeaveCriticalSection(&g_journalLock);
+}
+
+static void JsonEscape(const char* in,char* out,int cap)
+{
+    int o=0;
+    for(int i=0;in[i]&&o<cap-2;i++){
+        char c=in[i];
+        if(c=='"'||c=='\\'){ if(o<cap-3){out[o++]='\\';out[o++]=c;} }
+        else if(c=='\n'){ if(o<cap-3){out[o++]='\\';out[o++]='n';} }
+        else if(c=='\r'){  }
+        else if((unsigned char)c<0x20){  }
+        else out[o++]=c;
+    }
+    out[o]=0;
+}
+
+static void JournalWriteJson()
+{
+    if(!g_journalInit)return;
+    char path[MAX_PATH];
+    snprintf(path,MAX_PATH,"%s\\mp_journal.json",g_logDir);
+    HANDLE h=CreateFileA(path,GENERIC_WRITE,0,NULL,CREATE_ALWAYS,0,NULL);
+    if(h==INVALID_HANDLE_VALUE)return;
+    DWORD wr;
+    const char* head="{\"events\":[\n";
+    WriteFile(h,head,(DWORD)strlen(head),&wr,NULL);
+
+    EnterCriticalSection(&g_journalLock);
+    DWORD total=g_journalCount<JOURNAL_CAPACITY?g_journalCount:JOURNAL_CAPACITY;
+    DWORD now=GetTickCount();
+    char line[512],pe[128],de[192];
+    for(DWORD i=0;i<total;i++){
+
+        DWORD slot=(g_journalHead+JOURNAL_CAPACITY-1-i)%JOURNAL_CAPACITY;
+        JournalEntry& e=g_journal[slot];
+        JsonEscape(e.player,pe,sizeof(pe));
+        JsonEscape(e.detail,de,sizeof(de));
+        DWORD ageMs=now-e.timestamp;
+        int len=snprintf(line,sizeof(line),
+            "  {\"id\":%u,\"kind\":\"%s\",\"player\":\"%s\","
+            "\"detail\":\"%s\",\"x\":%.1f,\"z\":%.1f,\"age_s\":%u}%s\n",
+            e.id,EventKindName(e.kind),pe,de,e.x,e.z,ageMs/1000,
+            (i+1<total)?",":"");
+        WriteFile(h,line,len,&wr,NULL);
+    }
+    LeaveCriticalSection(&g_journalLock);
+
+    const char* tail="]}\n";
+    WriteFile(h,tail,(DWORD)strlen(tail),&wr,NULL);
+    CloseHandle(h);
+}
+
+static int JournalTally(PlayerTally* out,int maxOut)
+{
+    if(!g_journalInit)return 0;
+    int n=0;
+    EnterCriticalSection(&g_journalLock);
+    DWORD total=g_journalCount<JOURNAL_CAPACITY?g_journalCount:JOURNAL_CAPACITY;
+    for(DWORD i=0;i<total;i++){
+        JournalEntry& e=g_journal[i];
+        if(!e.player[0])continue;
+        int idx=-1;
+        for(int j=0;j<n;j++)if(strcmp(out[j].name,e.player)==0){idx=j;break;}
+        if(idx<0){
+            if(n>=maxOut)continue;
+            idx=n++;
+            strncpy(out[idx].name,e.player,63); out[idx].name[63]=0;
+            out[idx].builds=out[idx].demolishes=out[idx].roads=out[idx].chats=0;
+        }
+        switch(e.kind){
+            case EV_BUILD:    out[idx].builds++;     break;
+            case EV_DEMOLISH: out[idx].demolishes++; break;
+            case EV_ROAD:     out[idx].roads++;      break;
+            case EV_CHAT:     out[idx].chats++;      break;
+            default: break;
+        }
+    }
+    LeaveCriticalSection(&g_journalLock);
+    return n;
 }
 
 struct PlayerLockGuard {
@@ -543,25 +842,31 @@ static void BroadcastToAll(BYTE type, const void* data, DWORD size, int excl=-1)
 
 static void ClientSendBuild(const BuildCmd* cmd);
 static void ShmAddBuildNotify(const BuildCmd* cmd);
+static void ShmAddRoadNotify(const RoadCmd* cmd);
 
 static void BroadcastBuild(const BuildCmd* cmd)
 {
     ShmAddBuildNotify(cmd);
     LogBuild(cmd->playerName, cmd->typeName, cmd->x, cmd->z, cmd->rotation, cmd->sequenceId);
+    JournalAdd(EV_BUILD, cmd->playerName, cmd->typeName, cmd->x, cmd->z);
     if (strcmp(g_mode,"client")==0) ClientSendBuild(cmd);
     else BroadcastToAll(MSG_BUILD,cmd,sizeof(BuildCmd));
 }
 
+static void ClientSendDemolish(const DemolishCmd* cmd);
 static void BroadcastDemolish(const DemolishCmd* cmd)
 {
     if (!g_enableDemolishSync) return;
     g_totalDemolSession++;
+    JournalAdd(EV_DEMOLISH, cmd->playerName, "building", cmd->x, cmd->z);
+    if (strcmp(g_mode,"client")==0) { ClientSendDemolish(cmd); return; }
     BroadcastToAll(MSG_DEMOLISH,cmd,sizeof(DemolishCmd));
 }
 
+static void ClientSendRoad(const RoadCmd* cmd);
 static void BroadcastRoad(const RoadCmd* cmd)
 {
-    if (!g_enableRoadSync) return;
+    if (strcmp(g_mode,"client")==0) { ClientSendRoad(cmd); return; }
     BroadcastToAll(MSG_ROAD,cmd,sizeof(RoadCmd));
 }
 
@@ -587,6 +892,7 @@ static void BroadcastPlayerList()
         pkt.entries[n].ping=g_players[i].ping;
         pkt.entries[n].buildCount=g_players[i].buildCount;
         pkt.entries[n].bytesReceived=g_players[i].bytesReceived;
+        pkt.entries[n].color=g_players[i].color?g_players[i].color:g_slotColors[i%MAX_PLAYERS];
         pkt.entries[n].connected=1; pkt.entries[n].isHost=0;
         pkt.entries[n].slot=(BYTE)i;
         n++;
@@ -869,6 +1175,51 @@ static void HookedDemolHandler(__int64 param_1, char* param_2)
     } __except(EXCEPTION_EXECUTE_HANDLER){}
 }
 
+static void EmitRoad(float x1,float z1,float x2,float z2,BYTE category,const char* typeName)
+{
+    RoadCmd cmd={};
+    cmd.x1=x1; cmd.z1=z1; cmd.x2=x2; cmd.z2=z2;
+    cmd.category=category;
+    strncpy(cmd.roadType,typeName?typeName:"road",63);
+    strncpy(cmd.playerName,g_playerName,63);
+    cmd.timestamp=GetTickCount();
+    cmd.sequenceId=InterlockedIncrement(&g_roadSequenceId);
+    cmd.flags=0;
+    BroadcastRoad(&cmd);
+    ShmAddRoadNotify(&cmd);
+    { const char* cn=category==ROAD_CAT_PIPE?"pipe":category==ROAD_CAT_RAIL?"rail":category==ROAD_CAT_WIRE?"wire":"road";
+      JournalAdd(EV_ROAD,g_playerName,cn,x1,z1); }
+    const char* catStr = category==ROAD_CAT_PIPE?"PIPE":category==ROAD_CAT_RAIL?"RAIL":category==ROAD_CAT_WIRE?"WIRE":"ROAD";
+    H->log("multiplayer  %s (%.0f,%.0f)->(%.0f,%.0f) seq=%u",catStr,x1,z1,x2,z2,cmd.sequenceId);
+}
+
+static void HookedRoadHandler(void* param_1,float x1,float z1,float x2,float z2,int param_6)
+{
+    if(g_origRoadHandler)g_origRoadHandler(param_1,x1,z1,x2,z2,param_6);
+    if(!g_enableRoadSync)return;
+    __try {
+        if(x1||z1||x2||z2)EmitRoad(x1,z1,x2,z2,ROAD_CAT_ROAD,"road");
+    } __except(EXCEPTION_EXECUTE_HANDLER){}
+}
+
+static void HookedPipeHandler(void* param_1,float x1,float z1,float x2,float z2,int param_6)
+{
+    if(g_origPipeHandler)g_origPipeHandler(param_1,x1,z1,x2,z2,param_6);
+    if(!g_enablePipeSync)return;
+    __try {
+        if(x1||z1||x2||z2)EmitRoad(x1,z1,x2,z2,ROAD_CAT_PIPE,"pipe");
+    } __except(EXCEPTION_EXECUTE_HANDLER){}
+}
+
+static void HookedRailHandler(void* param_1,float x1,float z1,float x2,float z2,int param_6)
+{
+    if(g_origRailHandler)g_origRailHandler(param_1,x1,z1,x2,z2,param_6);
+    if(!g_enableRailSync)return;
+    __try {
+        if(x1||z1||x2||z2)EmitRoad(x1,z1,x2,z2,ROAD_CAT_RAIL,"rail");
+    } __except(EXCEPTION_EXECUTE_HANDLER){}
+}
+
 static bool InstallHook(DWORD_PTR rva,void* hookFn,void** origFn,BYTE* origBytes,const char* name,int hookSize)
 {
     BYTE* target=(BYTE*)((DWORD_PTR)g_hExe+rva);
@@ -970,8 +1321,22 @@ static DWORD WINAPI ClientThread(LPVOID arg)
             KickPacket kick;snprintf(kick.reason,sizeof(kick.reason),"Protocol v%d required, you have v%d",MP_PROTOCOL_VER,hs->protocolVersion);kick.canReconnect=0;
             SendMsgToPlayer(p,MSG_KICK,&kick,sizeof(kick));goto disconnect;
         }
+        if(g_password[0]){
+            if(strncmp(hs->password,g_password,63)!=0){
+                H->log("multiplayer  slot %d: wrong password",idx);
+                KickPacket kick;snprintf(kick.reason,sizeof(kick.reason),"Wrong server password");kick.canReconnect=1;
+                SendMsgToPlayer(p,MSG_KICK,&kick,sizeof(kick));goto disconnect;
+            }
+        }
         if(!hs->playerName[0])snprintf(hs->playerName,64,"Player_%d",idx);
+        char denyReason[128]={};
+        if(!IsPlayerAllowed(hs->playerName,denyReason,sizeof(denyReason))){
+            H->log("multiplayer  slot %d: %s denied — %s",idx,hs->playerName,denyReason);
+            KickPacket kick;strncpy(kick.reason,denyReason,sizeof(kick.reason)-1);kick.canReconnect=0;
+            SendMsgToPlayer(p,MSG_KICK,&kick,sizeof(kick));goto disconnect;
+        }
         strncpy(p.name,hs->playerName,63);
+        p.color=g_slotColors[idx%MAX_PLAYERS];
         p.handshakeDone=true;
         H->log("multiplayer  slot %d: %s handshake OK (client v%d.%d.%d mode=%s)",idx,p.name,hs->versionMajor,hs->versionMinor,hs->versionPatch,hs->gameMode);
         ServerInfoPacket info={};
@@ -982,6 +1347,7 @@ static DWORD WINAPI ClientThread(LPVOID arg)
         SendMsgToPlayer(p,MSG_SERVER_INFO,&info,sizeof(info));
     }
     H->log("multiplayer  player joined: %s (slot %d)",p.name,idx);
+    JournalAdd(EV_JOIN,p.name,"connected",0,0);
     {
         char joinMsg[128];snprintf(joinMsg,sizeof(joinMsg),"[SERVER] %s joined",p.name);
         BroadcastChat(joinMsg);
@@ -1051,10 +1417,11 @@ static DWORD WINAPI ClientThread(LPVOID arg)
                     BroadcastToAll(MSG_DEMOLISH,cmd,sizeof(DemolishCmd),idx);
                 }break;
             case MSG_ROAD:
-                if(size==sizeof(RoadCmd)&&g_enableRoadSync){
+                if(size==sizeof(RoadCmd)){
                     RoadCmd* cmd=(RoadCmd*)buf;
                     strncpy(cmd->playerName,p.name,63);
-                    H->log("multiplayer  [ROAD] %s placed %s",p.name,cmd->roadType);
+                    const char* catStr=cmd->category==ROAD_CAT_PIPE?"PIPE":cmd->category==ROAD_CAT_RAIL?"RAIL":cmd->category==ROAD_CAT_WIRE?"WIRE":"ROAD";
+                    H->log("multiplayer  [%s] %s (%.0f,%.0f)->(%.0f,%.0f)",catStr,p.name,cmd->x1,cmd->z1,cmd->x2,cmd->z2);
                     BroadcastToAll(MSG_ROAD,cmd,sizeof(RoadCmd),idx);
                 }break;
             case MSG_RESOURCE_REQ:
@@ -1245,14 +1612,21 @@ static DWORD WINAPI HeartbeatThread(LPVOID)
 
 static DWORD WINAPI StatsThread(LPVOID)
 {
+    DWORD tick=0;
     while(true){
-        Sleep(60000);
-        if(g_buildLogCount>0){FlushSessionLog();}
-        if(g_shm.block&&g_shm.Lock()){
-            g_shm.block->totalBuilds=g_totalBuildsSession;
-            g_shm.block->bytesSent=g_totalBytesSent;
-            g_shm.block->sessionUptime=(DWORD)((GetTickCount64()-g_sessionStart)/1000);
-            g_shm.Unlock();
+        Sleep(5000);
+        tick++;
+
+        if(strcmp(g_mode,"host")==0){WriteStatusHtml();JournalWriteJson();}
+
+        if(tick%12==0){
+            if(g_buildLogCount>0)FlushSessionLog();
+            if(g_shm.block&&g_shm.Lock()){
+                g_shm.block->totalBuilds=g_totalBuildsSession;
+                g_shm.block->bytesSent=g_totalBytesSent;
+                g_shm.block->sessionUptime=(DWORD)((GetTickCount64()-g_sessionStart)/1000);
+                g_shm.Unlock();
+            }
         }
     }
     return 0;
@@ -1262,6 +1636,9 @@ static void ReloadConfig()
 {
     g_enableDemolishSync =H->configInt("plugins\\multiplayer.ini","multiplayer","demolish_sync",1)!=0;
     g_enableRoadSync     =H->configInt("plugins\\multiplayer.ini","multiplayer","road_sync",0)!=0;
+    g_enablePipeSync     =H->configInt("plugins\\multiplayer.ini","multiplayer","pipe_sync",0)!=0;
+    g_enableRailSync     =H->configInt("plugins\\multiplayer.ini","multiplayer","rail_sync",0)!=0;
+    g_enableWireSync     =H->configInt("plugins\\multiplayer.ini","multiplayer","wire_sync",0)!=0;
     g_enableAntiSpam     =H->configInt("plugins\\multiplayer.ini","multiplayer","anti_spam",1)!=0;
     g_enableTerritories  =H->configInt("plugins\\multiplayer.ini","multiplayer","territories",0)!=0;
     g_enableSessionLog   =H->configInt("plugins\\multiplayer.ini","multiplayer","session_log",1)!=0;
@@ -1323,7 +1700,9 @@ static DWORD WINAPI ClientRecvThread(LPVOID)
         case MSG_ROAD:
             if(hdr.size==sizeof(RoadCmd)){
                 RoadCmd cmd;RecvAll(g_clientSock,(char*)&cmd,sizeof(cmd));g_clientBytesRecv+=sizeof(cmd);
-                H->log("multiplayer  client ROAD: %s by %s",cmd.roadType,cmd.playerName);
+                const char* cs=cmd.category==ROAD_CAT_PIPE?"PIPE":cmd.category==ROAD_CAT_RAIL?"RAIL":cmd.category==ROAD_CAT_WIRE?"WIRE":"ROAD";
+                H->log("multiplayer  client %s by %s (%.0f,%.0f)->(%.0f,%.0f)",cs,cmd.playerName,cmd.x1,cmd.z1,cmd.x2,cmd.z2);
+                ShmAddRoadNotify(&cmd);
             } else DrainSocket(g_clientSock,hdr.size);
             break;
         case MSG_CHAT:
@@ -1507,7 +1886,8 @@ static bool ClientConnect()
     }
     HandshakePacket hs={};hs.protocolVersion=MP_PROTOCOL_VER;
     hs.versionMajor=MP_VERSION_MAJOR;hs.versionMinor=MP_VERSION_MINOR;hs.versionPatch=MP_VERSION_PATCH;
-    strncpy(hs.playerName,g_playerName,63);strncpy(hs.gameMode,"client",15);hs.flags=0;
+    strncpy(hs.playerName,g_playerName,63);strncpy(hs.gameMode,"client",15);
+    strncpy(hs.password,g_password,63);hs.flags=0;
     MsgHeader sh={MSG_HANDSHAKE,sizeof(hs),CalcChecksum(&hs,sizeof(hs))};
     send(g_clientSock,(char*)&sh,sizeof(sh),0);send(g_clientSock,(char*)&hs,sizeof(hs),0);
     g_clientConnected=true;g_clientBytesSent=0;g_clientBytesRecv=0;
@@ -1527,6 +1907,30 @@ static void ClientSendBuild(const BuildCmd* cmd)
     LeaveCriticalSection(&g_typeNameLock);
     g_clientBytesSent+=sizeof(hdr)+sizeof(BuildCmd);
     H->log("multiplayer  client sent BUILD: %s at (%.0f,%.0f) seq=%u",cmd->typeName,cmd->x,cmd->z,cmd->sequenceId);
+}
+
+static void ClientSendRoad(const RoadCmd* cmd)
+{
+    if(!g_clientConnected||g_clientSock==INVALID_SOCKET)return;
+    MsgHeader hdr={MSG_ROAD,sizeof(RoadCmd),CalcChecksum(cmd,sizeof(RoadCmd))};
+    EnterCriticalSection(&g_typeNameLock);
+    send(g_clientSock,(char*)&hdr,sizeof(hdr),0);
+    send(g_clientSock,(char*)cmd,sizeof(RoadCmd),0);
+    LeaveCriticalSection(&g_typeNameLock);
+    g_clientBytesSent+=sizeof(hdr)+sizeof(RoadCmd);
+    H->log("multiplayer  client sent ROAD cat=%d (%.0f,%.0f)->(%.0f,%.0f)",cmd->category,cmd->x1,cmd->z1,cmd->x2,cmd->z2);
+}
+
+static void ClientSendDemolish(const DemolishCmd* cmd)
+{
+    if(!g_clientConnected||g_clientSock==INVALID_SOCKET)return;
+    MsgHeader hdr={MSG_DEMOLISH,sizeof(DemolishCmd),CalcChecksum(cmd,sizeof(DemolishCmd))};
+    EnterCriticalSection(&g_typeNameLock);
+    send(g_clientSock,(char*)&hdr,sizeof(hdr),0);
+    send(g_clientSock,(char*)cmd,sizeof(DemolishCmd),0);
+    LeaveCriticalSection(&g_typeNameLock);
+    g_clientBytesSent+=sizeof(hdr)+sizeof(DemolishCmd);
+    H->log("multiplayer  client sent DEMOLISH at (%.0f,%.0f)",cmd->x,cmd->z);
 }
 
 static void ShmUpdateStatus()
@@ -1564,6 +1968,20 @@ static void ShmAddBuildNotify(const BuildCmd* cmd)
     BuildNotify& n=g_shm.block->buildNotify[idx];
     strncpy(n.playerName,cmd->playerName,63);strncpy(n.typeName,cmd->typeName,127);
     n.x=cmd->x;n.z=cmd->z;n.timestamp=GetTickCount();
+    g_shm.block->buildNotifyCount++;
+    g_shm.Unlock();
+}
+
+static void ShmAddRoadNotify(const RoadCmd* cmd)
+{
+
+    if(!g_shm.block||!g_shm.Lock())return;
+    DWORD idx=g_shm.block->buildNotifyCount%MAX_BUILD_NOTIFY;
+    BuildNotify& n=g_shm.block->buildNotify[idx];
+    strncpy(n.playerName,cmd->playerName,63);
+    const char* cs=cmd->category==ROAD_CAT_PIPE?"pipe":cmd->category==ROAD_CAT_RAIL?"rail":cmd->category==ROAD_CAT_WIRE?"wire":"road";
+    strncpy(n.typeName,cs,127);
+    n.x=cmd->x1;n.z=cmd->z1;n.timestamp=GetTickCount();
     g_shm.block->buildNotifyCount++;
     g_shm.Unlock();
 }
@@ -1637,12 +2055,16 @@ extern "C" __declspec(dllexport) int TsmPluginInit(const TsmHost* host, TsmPlugi
     H->configString("plugins\\multiplayer.ini","multiplayer","mode",g_mode,sizeof(g_mode),"host");
     H->configString("plugins\\multiplayer.ini","multiplayer","host_ip",g_hostIp,sizeof(g_hostIp),"127.0.0.1");
     H->configString("plugins\\multiplayer.ini","multiplayer","name",g_playerName,sizeof(g_playerName),"Player");
+    H->configString("plugins\\multiplayer.ini","multiplayer","password",g_password,sizeof(g_password),"");
     H->configString("plugins\\multiplayer.ini","multiplayer","save_dir",g_saveDir,sizeof(g_saveDir),"media_soviet/save");
     H->configString("plugins\\multiplayer.ini","multiplayer","sync_dir",g_syncDir,sizeof(g_syncDir),"mp_sync");
     H->configString("plugins\\multiplayer.ini","multiplayer","log_dir",g_logDir,sizeof(g_logDir),"mp_logs");
     g_port              =H->configInt("plugins\\multiplayer.ini","multiplayer","port",7777);
     g_enableDemolishSync=H->configInt("plugins\\multiplayer.ini","multiplayer","demolish_sync",1)!=0;
     g_enableRoadSync    =H->configInt("plugins\\multiplayer.ini","multiplayer","road_sync",0)!=0;
+    g_enablePipeSync    =H->configInt("plugins\\multiplayer.ini","multiplayer","pipe_sync",0)!=0;
+    g_enableRailSync    =H->configInt("plugins\\multiplayer.ini","multiplayer","rail_sync",0)!=0;
+    g_enableWireSync    =H->configInt("plugins\\multiplayer.ini","multiplayer","wire_sync",0)!=0;
     g_enableAntiSpam    =H->configInt("plugins\\multiplayer.ini","multiplayer","anti_spam",1)!=0;
     g_enableTerritories =H->configInt("plugins\\multiplayer.ini","multiplayer","territories",0)!=0;
     g_enableSessionLog  =H->configInt("plugins\\multiplayer.ini","multiplayer","session_log",1)!=0;
@@ -1654,6 +2076,7 @@ extern "C" __declspec(dllexport) int TsmPluginInit(const TsmHost* host, TsmPlugi
     for(int i=0;i<MAX_PLAYERS;i++){g_players[i].sock=INVALID_SOCKET;g_players[i].slot=(DWORD)i;InitializeCriticalSection(&g_players[i].netLock);}
     InitializeCriticalSection(&g_lock);InitializeCriticalSection(&g_typeNameLock);
     InitializeCriticalSection(&g_logLock);InitializeCriticalSection(&g_buildLogLock);InitializeCriticalSection(&g_dedupLock);
+    JournalInit();
     H->log("multiplayer  v%d.%d.%d loaded | mode=%s name=%s port=%d maxplayers=%d",MP_VERSION_MAJOR,MP_VERSION_MINOR,MP_VERSION_PATCH,g_mode,g_playerName,g_port,g_maxPlayers);
     H->log("multiplayer  config: demolish=%d road=%d spam=%d terr=%d rate=%d log=%d",g_enableDemolishSync,g_enableRoadSync,g_enableAntiSpam,g_enableTerritories,g_maxBuildRate,g_enableSessionLog);
     return 0;
@@ -1701,9 +2124,30 @@ extern "C" __declspec(dllexport) int TsmPluginStart(void)
         else H->log("multiplayer  demolish hook: offset mismatch at RVA 0x%X got %02X %02X %02X",HOOK_DEMOL_RVA,dt[0],dt[1],dt[2]);
     }
     H->log("multiplayer  hooks: build=%d place=%d demolish=%d",hookBuild,hookPlace,hookDemol);
+
+    bool hookRoad=false,hookPipe=false,hookRail=false;
+    if(g_enableRoadSync){
+        BYTE* rt=(BYTE*)((DWORD_PTR)g_hExe+HOOK_ROAD_RVA);
+        if(rt[0]==0x48&&rt[1]==0x8B&&rt[2]==0xC4)
+            hookRoad=InstallHook(HOOK_ROAD_RVA,(void*)HookedRoadHandler,(void**)&g_origRoadHandler,g_roadOrigBytes,"road",14);
+        else H->log("multiplayer  road hook: offset mismatch at RVA 0x%X got %02X %02X %02X",HOOK_ROAD_RVA,rt[0],rt[1],rt[2]);
+    }
+    if(g_enablePipeSync&&HOOK_PIPE_RVA){
+        BYTE* pt=(BYTE*)((DWORD_PTR)g_hExe+HOOK_PIPE_RVA);
+        if(pt[0]==0x48&&pt[1]==0x8B&&pt[2]==0xC4)
+            hookPipe=InstallHook(HOOK_PIPE_RVA,(void*)HookedPipeHandler,(void**)&g_origPipeHandler,g_pipeOrigBytes,"pipe",14);
+        else H->log("multiplayer  pipe hook: offset mismatch at RVA 0x%X got %02X %02X %02X",HOOK_PIPE_RVA,pt[0],pt[1],pt[2]);
+    }
+    if(g_enableRailSync&&HOOK_RAIL_RVA){
+        BYTE* lt=(BYTE*)((DWORD_PTR)g_hExe+HOOK_RAIL_RVA);
+        if(lt[0]==0x48&&lt[1]==0x8B&&lt[2]==0xC4)
+            hookRail=InstallHook(HOOK_RAIL_RVA,(void*)HookedRailHandler,(void**)&g_origRailHandler,g_railOrigBytes,"rail",14);
+        else H->log("multiplayer  rail hook: offset mismatch at RVA 0x%X got %02X %02X %02X",HOOK_RAIL_RVA,lt[0],lt[1],lt[2]);
+    }
+    H->log("multiplayer  infra hooks: road=%d pipe=%d rail=%d",hookRoad,hookPipe,hookRail);
+
     if(hookBuild&&hookPlace){
         H->log("multiplayer  v%d.%d.%d ACTIVE — realtime sync ON",MP_VERSION_MAJOR,MP_VERSION_MINOR,MP_VERSION_PATCH);
-        if(g_enableRoadSync)H->log("multiplayer  road sync: enabled (hook pending Ghidra)");
         if(g_enableTerritories)H->log("multiplayer  territories: enabled");
         if(g_enableSessionLog)H->log("multiplayer  session log: %s",g_logDir);
     } else {
@@ -1721,6 +2165,9 @@ BOOL APIENTRY DllMain(HMODULE, DWORD reason, LPVOID)
         if(g_origBuildHandler)RemoveHook(HOOK_BUILD_RVA,g_buildOrigBytes,14);
         if(g_origPlaceHandler)RemoveHook(HOOK_PLACE_RVA,g_placeOrigBytes,16);
         if(g_origDemolHandler)RemoveHook(HOOK_DEMOL_RVA,g_demolOrigBytes,14);
+        if(g_origRoadHandler)RemoveHook(HOOK_ROAD_RVA,g_roadOrigBytes,14);
+        if(g_origPipeHandler)RemoveHook(HOOK_PIPE_RVA,g_pipeOrigBytes,14);
+        if(g_origRailHandler)RemoveHook(HOOK_RAIL_RVA,g_railOrigBytes,14);
     }
     return TRUE;
 }
